@@ -1383,7 +1383,7 @@ Examples:
             r##"
 agent-browser press - Press a key or key combination
 
-Usage: agent-browser press <key>
+Usage: agent-browser press <key> [--raw]
 
 Presses a key or key combination. Supports special keys and modifiers.
 
@@ -1398,6 +1398,12 @@ Special Keys:
 Modifiers (combine with +):
   Control, Alt, Shift, Meta
 
+Options:
+  --raw                Use CDP rawKeyDown (instead of keyDown). Required for
+                       keys Chrome's password-manager autofill picker
+                       responds to (ArrowDown to highlight, Enter to commit).
+                       Adds a 100ms hold before keyUp.
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -1408,6 +1414,7 @@ Examples:
   agent-browser press Control+a
   agent-browser press Control+Shift+s
   agent-browser press Escape
+  agent-browser press ArrowDown --raw   # drive password-manager picker
 "##
         }
         "keydown" => {

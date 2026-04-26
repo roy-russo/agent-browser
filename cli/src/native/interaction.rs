@@ -274,7 +274,7 @@ pub async fn type_text_into_active_context(
 }
 
 pub async fn press_key(client: &CdpClient, session_id: &str, key: &str) -> Result<(), String> {
-    press_key_with_modifiers(client, session_id, key, None).await
+    press_key_with_modifiers(client, session_id, key, None, false).await
 }
 
 /// Dispatch a keyDown+keyUp sequence for `key` with an optional CDP modifier bitmask.
@@ -284,18 +284,25 @@ pub async fn press_key(client: &CdpClient, session_id: &str, key: &str) -> Resul
 ///
 /// Callers that need a platform-appropriate modifier (e.g. Cmd on macOS,
 /// Ctrl elsewhere) must choose the value themselves -- see `cfg!(target_os)`.
+///
+/// When `raw` is true, sends `rawKeyDown` instead of `keyDown` and suppresses
+/// `text`/`unmodifiedText`. This is the only payload Chrome's password-manager
+/// autofill dropdown responds to (see vault-iterate-log.md substrate finding).
 pub async fn press_key_with_modifiers(
     client: &CdpClient,
     session_id: &str,
     key: &str,
     modifiers: Option<i32>,
+    raw: bool,
 ) -> Result<(), String> {
     let (key_name, code, key_code) = named_key_info(key);
 
     // Suppress text insertion when Control (2) or Meta (4) modifiers are active,
     // since these are command chords (e.g. Ctrl+A = select-all), not text input.
+    // Also suppress in raw mode — rawKeyDown is for keys that should not insert
+    // characters (ArrowDown to open a picker, Enter to commit a selection).
     let has_command_modifier = modifiers.is_some_and(|m| m & (2 | 4) != 0);
-    let text = if has_command_modifier {
+    let text = if has_command_modifier || raw {
         None
     } else {
         key_text(&key_name)
@@ -305,7 +312,7 @@ pub async fn press_key_with_modifiers(
         .send_command_typed::<_, Value>(
             "Input.dispatchKeyEvent",
             &DispatchKeyEventParams {
-                event_type: "keyDown".to_string(),
+                event_type: if raw { "rawKeyDown" } else { "keyDown" }.to_string(),
                 key: Some(key_name.clone()),
                 code: Some(code.clone()),
                 text: text.clone(),
@@ -317,6 +324,14 @@ pub async fn press_key_with_modifiers(
             Some(session_id),
         )
         .await?;
+
+    // Hold-time before keyUp. Chrome's password-manager autofill picker needs
+    // the keyDown to be visible long enough to register; with 0ms hold, the
+    // event sequence races and the picker doesn't update its preview state.
+    // 100ms matches the validated cdp-autofill-pick.mjs recipe.
+    if raw {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 
     client
         .send_command_typed::<_, Value>(

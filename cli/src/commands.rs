@@ -430,11 +430,19 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
 
         // === Keyboard ===
         "press" | "key" => {
-            let key = rest.first().ok_or_else(|| ParseError::MissingArguments {
-                context: "press".to_string(),
-                usage: "press <key>",
-            })?;
-            Ok(json!({ "id": id, "action": "press", "key": key }))
+            // --raw routes to CDP `rawKeyDown` instead of `keyDown`. Required
+            // for keys Chrome's password-manager autofill dropdown listens to
+            // (ArrowDown to open, Enter to commit) — see vault-iterate-log.md.
+            let raw = rest.iter().any(|s| *s == "--raw");
+            let key = rest
+                .iter()
+                .find(|s| !s.starts_with("--"))
+                .copied()
+                .ok_or_else(|| ParseError::MissingArguments {
+                    context: "press".to_string(),
+                    usage: "press <key> [--raw]",
+                })?;
+            Ok(json!({ "id": id, "action": "press", "key": key, "raw": raw }))
         }
         "keydown" => {
             let key = rest.first().ok_or_else(|| ParseError::MissingArguments {

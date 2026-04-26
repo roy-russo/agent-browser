@@ -2771,12 +2771,14 @@ async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .get("key")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'key' parameter")?;
+    let raw = cmd.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Parse modifier+key chords like "Control+a", "Shift+Enter", "Control+Shift+a"
     let (actual_key, modifiers) = parse_key_chord(key);
 
-    interaction::press_key_with_modifiers(&mgr.client, &session_id, &actual_key, modifiers).await?;
-    Ok(json!({ "pressed": key }))
+    interaction::press_key_with_modifiers(&mgr.client, &session_id, &actual_key, modifiers, raw)
+        .await?;
+    Ok(json!({ "pressed": key, "raw": raw }))
 }
 
 /// Parse a key chord string like "Control+a" or "Control+Shift+Enter" into
@@ -5068,13 +5070,25 @@ async fn handle_clipboard(cmd: &Value, state: &DaemonState) -> Result<Value, Str
             Ok(json!({ "written": text }))
         }
         "copy" => {
-            interaction::press_key_with_modifiers(&mgr.client, &session_id, "c", Some(modifier))
-                .await?;
+            interaction::press_key_with_modifiers(
+                &mgr.client,
+                &session_id,
+                "c",
+                Some(modifier),
+                false,
+            )
+            .await?;
             Ok(json!({ "copied": true }))
         }
         "paste" => {
-            interaction::press_key_with_modifiers(&mgr.client, &session_id, "v", Some(modifier))
-                .await?;
+            interaction::press_key_with_modifiers(
+                &mgr.client,
+                &session_id,
+                "v",
+                Some(modifier),
+                false,
+            )
+            .await?;
             Ok(json!({ "pasted": true }))
         }
         _ => {
