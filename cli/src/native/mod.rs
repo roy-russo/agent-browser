@@ -3,6 +3,8 @@ pub mod actions;
 #[allow(dead_code)]
 pub mod auth;
 #[allow(dead_code)]
+pub mod ax;
+#[allow(dead_code)]
 pub mod browser;
 #[allow(dead_code)]
 pub mod cdp;

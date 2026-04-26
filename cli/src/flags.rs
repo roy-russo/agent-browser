@@ -846,6 +846,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--content-boundaries",
         "--confirm-interactive",
         "--no-auto-dialog",
+        "--no-ax",
         "-v",
         "--verbose",
         "-q",
@@ -858,6 +859,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
     // Global flags that always take a value (need to skip the next arg too)
     const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
         "--session",
+        "--ax-pid",
         "--headers",
         "--executable-path",
         "--cdp",

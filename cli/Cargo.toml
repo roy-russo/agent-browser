@@ -39,6 +39,12 @@ rust-embed = "8"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility = "0.2"
+accessibility-sys = "0.2"
+core-foundation = "0.10"
+core-graphics-types = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_Foundation"] }
 

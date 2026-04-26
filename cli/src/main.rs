@@ -648,6 +648,17 @@ fn main() {
         }
     };
 
+    // AX bundling controls (macOS): --no-ax opts out, --ax-pid <N> overrides
+    // PID detection. Stripped from `clean` already, so read raw args here.
+    if args.iter().any(|a| a == "--no-ax") {
+        cmd["no_ax"] = json!(true);
+    }
+    if let Some(idx) = args.iter().position(|a| a == "--ax-pid") {
+        if let Some(v) = args.get(idx + 1).and_then(|s| s.parse::<i64>().ok()) {
+            cmd["ax_pid"] = json!(v);
+        }
+    }
+
     // Handle --password-stdin for auth save
     if cmd.get("action").and_then(|v| v.as_str()) == Some("auth_save") {
         if cmd.get("password").is_some() {
@@ -703,12 +714,14 @@ fn main() {
                 data: Some(data),
                 error: None,
                 warning: None,
+                ax: None,
             },
             Err(e) => connection::Response {
                 success: false,
                 data: None,
                 error: Some(e),
                 warning: None,
+                ax: None,
             },
         };
         let output_opts = OutputOptions::from_flags(&flags);

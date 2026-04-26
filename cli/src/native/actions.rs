@@ -1444,6 +1444,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "mousemove" => handle_mousemove(cmd, state).await,
         "mousedown" => handle_mousedown(cmd, state).await,
         "mouseup" => handle_mouseup(cmd, state).await,
+        "ax_snapshot" => handle_ax_snapshot(cmd).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
@@ -1451,6 +1452,21 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         Ok(data) => success_response(&id, data),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
+
+    // Default-on AX bundling (macOS only). Skip when `no_ax` is set on the cmd
+    // or for the standalone ax_snapshot action (which already returns AX data).
+    // Failure to read AX is silent — AX is supplementary, not load-bearing.
+    let no_ax = cmd
+        .get("no_ax")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !no_ax && action != "ax_snapshot" {
+        if let Some(ax_value) = bundle_ax(cmd) {
+            if let Some(obj) = resp.as_object_mut() {
+                obj.insert("ax".to_string(), ax_value);
+            }
+        }
+    }
 
     // Auto-report pending JavaScript dialog so agents know why commands may hang
     if action != "dialog" {
@@ -8093,6 +8109,50 @@ async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
         .await?;
     Ok(json!({ "released": true }))
+}
+
+// ---------------------------------------------------------------------------
+// AX snapshot — macOS Accessibility tree of Chrome's process. See native/ax.rs.
+// ---------------------------------------------------------------------------
+
+/// Resolves the Chrome PID for AX inspection. Honors `cmd.ax_pid` when set,
+/// otherwise auto-detects the Chrome process exposing CDP on the dev port.
+#[cfg(target_os = "macos")]
+fn resolve_ax_pid(cmd: &Value) -> Option<i32> {
+    if let Some(p) = cmd.get("ax_pid").and_then(|v| v.as_i64()) {
+        return Some(p as i32);
+    }
+    super::ax::detect_chrome_pid()
+}
+
+/// Best-effort AX snapshot for default-on bundling. Silent on any failure —
+/// AX is observational, not load-bearing on the action's correctness.
+#[cfg(target_os = "macos")]
+fn bundle_ax(cmd: &Value) -> Option<Value> {
+    let pid = resolve_ax_pid(cmd)?;
+    super::ax::focused_snapshot(pid).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bundle_ax(_cmd: &Value) -> Option<Value> {
+    None
+}
+
+async fn handle_ax_snapshot(cmd: &Value) -> Result<Value, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = resolve_ax_pid(cmd).ok_or_else(|| {
+            "Chrome PID not found. Pass --pid <N> or ensure Chrome is running with \
+             --remote-debugging-port=9222."
+                .to_string()
+        })?;
+        super::ax::focused_snapshot(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cmd;
+        Err("ax_snapshot is only available on macOS".into())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,11 @@ pub struct Response {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// macOS Accessibility snapshot (focused element + popups). Default-on
+    /// when targeting Chrome on macOS; suppressed by `--no-ax`. Carries
+    /// in-process AX state captured around the action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ax: Option<Value>,
 }
 
 #[allow(dead_code)]

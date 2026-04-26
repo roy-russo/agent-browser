@@ -1698,6 +1698,13 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(json!({ "id": id, "action": "removeinitscript", "identifier": identifier }))
         }
 
+        // === AX snapshot (macOS) ===
+        // Returns the focused element + visible popups from Chrome's macOS
+        // Accessibility tree. Honors --ax-pid <N>; auto-detects otherwise.
+        "ax-snapshot" | "ax_snapshot" | "ax" => {
+            Ok(json!({ "id": id, "action": "ax_snapshot" }))
+        }
+
         _ => Err(ParseError::UnknownCommand {
             command: cmd.to_string(),
         }),
