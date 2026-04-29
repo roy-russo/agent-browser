@@ -1705,6 +1705,66 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(json!({ "id": id, "action": "ax_snapshot" }))
         }
 
+        // === AX click (macOS) ===
+        // HID-tap synthetic click — trusted-gesture path for autofill UX
+        // that CDP `click` doesn't satisfy. Two addressing modes:
+        //   ax-click <selector>       — DOM element (AB does viewport→screen
+        //                                translation via window.screenX/Y +
+        //                                outerHeight-innerHeight)
+        //   ax-click --x <X> --y <Y>  — raw screen coords (popup items
+        //                                publish these directly in
+        //                                ax.popups[i].items[j])
+        "ax-click" | "ax_click" => {
+            let mut x: Option<f64> = None;
+            let mut y: Option<f64> = None;
+            let mut settle_ms: Option<i64> = None;
+            let mut selector: Option<String> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--x" => {
+                        i += 1;
+                        x = rest.get(i).and_then(|v| v.parse::<f64>().ok());
+                    }
+                    "--y" => {
+                        i += 1;
+                        y = rest.get(i).and_then(|v| v.parse::<f64>().ok());
+                    }
+                    "--settle-ms" => {
+                        i += 1;
+                        settle_ms = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    other if !other.starts_with("--") && selector.is_none() => {
+                        selector = Some(other.to_string());
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            if x.is_none() && y.is_none() && selector.is_none() {
+                return Err(ParseError::MissingArguments {
+                    context: "ax-click".to_string(),
+                    usage: "ax-click <selector>  |  ax-click --x <X> --y <Y> [--settle-ms <N>]",
+                });
+            }
+
+            let mut payload = json!({ "id": id, "action": "ax_click" });
+            if let Some(s) = selector {
+                payload["selector"] = json!(s);
+            }
+            if let Some(xv) = x {
+                payload["x"] = json!(xv);
+            }
+            if let Some(yv) = y {
+                payload["y"] = json!(yv);
+            }
+            if let Some(s) = settle_ms {
+                payload["settle_ms"] = json!(s);
+            }
+            Ok(payload)
+        }
+
         _ => Err(ParseError::UnknownCommand {
             command: cmd.to_string(),
         }),

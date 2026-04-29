@@ -431,10 +431,86 @@ mod imp {
     // Suppress unused warnings for items kept for symmetry with probe.swift.
     const _UNUSED: &str = kAXMainAttribute;
     const _UNUSED2: usize = TEXT_TRUNCATE;
+
+    // -----------------------------------------------------------------------
+    // HID-tap synthetic click — the trusted-gesture path. Required because
+    // CDP `Input.dispatchMouseEvent` is not treated as a real user gesture by
+    // Chrome's autofill heuristics: clicking a saved-password field via CDP
+    // either silently auto-fills (single credential) or does nothing visible
+    // toward the AX picker. Posting a CGEvent through the HID tap goes through
+    // the normal macOS input pipeline, which Chrome accepts as trusted.
+    //
+    // Side effect: the user's real cursor visibly moves to (x, y) for the
+    // duration of the click. This is the price of trusted-gesture handling
+    // and is intrinsic to the HID tap mechanism — `postToPid` does not move
+    // the cursor but didn't reliably route mouse-down/up to the rendered
+    // widget in our argos.co.uk picker repro.
+    // -----------------------------------------------------------------------
+
+    extern "C" {
+        fn CGEventCreateMouseEvent(
+            source: *const c_void,
+            mouse_type: u32,
+            mouse_cursor_position: CGPoint,
+            mouse_button: u32,
+        ) -> *mut c_void;
+        fn CGEventPost(tap: u32, event: *mut c_void);
+    }
+
+    const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+    const K_CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
+    const K_CG_EVENT_MOUSE_MOVED: u32 = 5;
+    const K_CG_HID_EVENT_TAP: u32 = 0;
+    const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
+
+    /// Bring the target PID's frontmost window to front via System Events.
+    /// CGEvent HID-tap routing depends on the target window being key —
+    /// without activation, the event lands wherever the user's last-focused
+    /// window was. osascript is shelled out (no extra crate needed for an
+    /// AppKit/Cocoa binding).
+    fn activate_pid(pid: i32) {
+        let script = format!(
+            "tell application \"System Events\" to set frontmost of (first process whose unix id is {}) to true",
+            pid
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output();
+    }
+
+    fn post_event(mouse_type: u32, x: f64, y: f64) {
+        unsafe {
+            let pos = CGPoint { x, y };
+            let ev = CGEventCreateMouseEvent(
+                std::ptr::null(),
+                mouse_type,
+                pos,
+                K_CG_MOUSE_BUTTON_LEFT,
+            );
+            if !ev.is_null() {
+                CGEventPost(K_CG_HID_EVENT_TAP, ev);
+                CFRelease(ev as CFTypeRef);
+            }
+        }
+    }
+
+    /// Synthesize a left-click at screen `(x, y)` via the HID event tap, after
+    /// activating `pid`'s frontmost window. Returns immediately after the
+    /// up event posts; callers should sleep ~150-300ms before reading state
+    /// if a follow-on UI (autofill picker, dialog) is expected to render.
+    pub fn hid_click(x: f64, y: f64, pid: i32) {
+        activate_pid(pid);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        post_event(K_CG_EVENT_MOUSE_MOVED, x, y);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        post_event(K_CG_EVENT_LEFT_MOUSE_DOWN, x, y);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        post_event(K_CG_EVENT_LEFT_MOUSE_UP, x, y);
+    }
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{detect_chrome_pid, focused_snapshot};
+pub use imp::{detect_chrome_pid, focused_snapshot, hid_click};
 
 #[cfg(not(target_os = "macos"))]
 pub fn focused_snapshot(_pid: i32) -> Result<serde_json::Value, String> {
@@ -445,3 +521,6 @@ pub fn focused_snapshot(_pid: i32) -> Result<serde_json::Value, String> {
 pub fn detect_chrome_pid() -> Option<i32> {
     None
 }
+
+#[cfg(not(target_os = "macos"))]
+pub fn hid_click(_x: f64, _y: f64, _pid: i32) {}

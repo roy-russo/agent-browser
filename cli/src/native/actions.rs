@@ -1445,6 +1445,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "mousedown" => handle_mousedown(cmd, state).await,
         "mouseup" => handle_mouseup(cmd, state).await,
         "ax_snapshot" => handle_ax_snapshot(cmd).await,
+        "ax_click" => handle_ax_click(cmd, state).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
@@ -8153,6 +8154,108 @@ async fn handle_ax_snapshot(cmd: &Value) -> Result<Value, String> {
         let _ = cmd;
         Err("ax_snapshot is only available on macOS".into())
     }
+}
+
+// ---------------------------------------------------------------------------
+// AX click — HID-tap synthetic click. Trusted gesture path for autofill UX
+// that CDP `Input.dispatchMouseEvent` doesn't satisfy. Two addressing modes:
+//   1. Raw screen coords (--x --y) — popup items expose these directly in the
+//      bundled `ax.popups[i].items[j]` rect; caller computes center.
+//   2. CSS selector — AB queries the page for getBoundingClientRect plus
+//      window.screenX/screenY and (outerHeight - innerHeight) to translate
+//      viewport coords to the screen-coord space CGEvent expects.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+async fn handle_ax_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let pid = resolve_ax_pid(cmd).ok_or_else(|| {
+        "Chrome PID not found. Pass --ax-pid <N> or ensure Chrome is running with \
+         --remote-debugging-port=9222."
+            .to_string()
+    })?;
+
+    let raw_x = cmd.get("x").and_then(|v| v.as_f64());
+    let raw_y = cmd.get("y").and_then(|v| v.as_f64());
+
+    let (sx, sy, mode) = if let (Some(x), Some(y)) = (raw_x, raw_y) {
+        (x, y, "coords")
+    } else {
+        let selector = cmd
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .ok_or("ax-click needs either --x and --y, or a CSS selector")?;
+
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        let session_id = mgr.active_session_id()?.to_string();
+
+        let js = format!(
+            r#"(() => {{
+                const e = document.querySelector({sel});
+                if (!e) return null;
+                const r = e.getBoundingClientRect();
+                return {{
+                    sx: window.screenX,
+                    sy: window.screenY,
+                    chromeY: window.outerHeight - window.innerHeight,
+                    vx: r.x + r.width / 2,
+                    vy: r.y + r.height / 2,
+                }};
+            }})()"#,
+            sel = serde_json::to_string(selector).unwrap_or_else(|_| "null".to_string())
+        );
+
+        use super::cdp::types::EvaluateParams;
+        let result: super::cdp::types::EvaluateResult = mgr
+            .client
+            .send_command_typed(
+                "Runtime.evaluate",
+                &EvaluateParams {
+                    expression: js,
+                    return_by_value: Some(true),
+                    await_promise: Some(false),
+                },
+                Some(&session_id),
+            )
+            .await?;
+        let val = result.result.value.unwrap_or(Value::Null);
+        if val.is_null() {
+            return Err(format!("Element not found: {}", selector));
+        }
+        let win_sx = val.get("sx").and_then(|v| v.as_f64()).ok_or("missing sx")?;
+        let win_sy = val.get("sy").and_then(|v| v.as_f64()).ok_or("missing sy")?;
+        let chrome_y = val
+            .get("chromeY")
+            .and_then(|v| v.as_f64())
+            .ok_or("missing chromeY")?;
+        let vx = val.get("vx").and_then(|v| v.as_f64()).ok_or("missing vx")?;
+        let vy = val.get("vy").and_then(|v| v.as_f64()).ok_or("missing vy")?;
+        (win_sx + vx, win_sy + chrome_y + vy, "selector")
+    };
+
+    super::ax::hid_click(sx, sy, pid);
+
+    // Settle window: HID-tap returns immediately, but autofill picker /
+    // popup rendering takes ~100-200ms. Wait so the default-on AX bundle
+    // captures the post-click UI in the response.
+    let settle_ms = cmd
+        .get("settle_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(220) as u64;
+    tokio::time::sleep(tokio::time::Duration::from_millis(settle_ms)).await;
+
+    Ok(json!({
+        "ax_clicked": true,
+        "mode": mode,
+        "screen_x": sx,
+        "screen_y": sy,
+        "pid": pid,
+        "settled_ms": settle_ms,
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn handle_ax_click(_cmd: &Value, _state: &mut DaemonState) -> Result<Value, String> {
+    Err("ax-click is only available on macOS".into())
 }
 
 // ---------------------------------------------------------------------------
