@@ -463,21 +463,6 @@ mod imp {
     const K_CG_HID_EVENT_TAP: u32 = 0;
     const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
 
-    /// Bring the target PID's frontmost window to front via System Events.
-    /// CGEvent HID-tap routing depends on the target window being key —
-    /// without activation, the event lands wherever the user's last-focused
-    /// window was. osascript is shelled out (no extra crate needed for an
-    /// AppKit/Cocoa binding).
-    fn activate_pid(pid: i32) {
-        let script = format!(
-            "tell application \"System Events\" to set frontmost of (first process whose unix id is {}) to true",
-            pid
-        );
-        let _ = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .output();
-    }
-
     fn post_event(mouse_type: u32, x: f64, y: f64) {
         unsafe {
             let pos = CGPoint { x, y };
@@ -494,13 +479,15 @@ mod imp {
         }
     }
 
-    /// Synthesize a left-click at screen `(x, y)` via the HID event tap, after
-    /// activating `pid`'s frontmost window. Returns immediately after the
-    /// up event posts; callers should sleep ~150-300ms before reading state
-    /// if a follow-on UI (autofill picker, dialog) is expected to render.
-    pub fn hid_click(x: f64, y: f64, pid: i32) {
-        activate_pid(pid);
-        std::thread::sleep(std::time::Duration::from_millis(150));
+    /// Synthesize a left-click at screen `(x, y)` via the HID event tap.
+    /// Returns immediately after the up event posts; callers should sleep
+    /// ~150-300ms before reading state if a follow-on UI (autofill picker,
+    /// dialog) is expected to render.
+    ///
+    /// Caller's responsibility to ensure the target Chrome window is the
+    /// key window before calling — typically already true after a runAB
+    /// `click` / `open` sequence in normal recipes.
+    pub fn hid_click(x: f64, y: f64) {
         post_event(K_CG_EVENT_MOUSE_MOVED, x, y);
         std::thread::sleep(std::time::Duration::from_millis(20));
         post_event(K_CG_EVENT_LEFT_MOUSE_DOWN, x, y);
@@ -523,4 +510,4 @@ pub fn detect_chrome_pid() -> Option<i32> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn hid_click(_x: f64, _y: f64, _pid: i32) {}
+pub fn hid_click(_x: f64, _y: f64) {}

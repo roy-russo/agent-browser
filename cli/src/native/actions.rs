@@ -8232,7 +8232,7 @@ async fn handle_ax_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         (win_sx + vx, win_sy + chrome_y + vy, "selector")
     };
 
-    super::ax::hid_click(sx, sy, pid);
+    super::ax::hid_click(sx, sy);
 
     // Settle window: HID-tap returns immediately, but autofill picker /
     // popup rendering takes ~100-200ms. Wait so the default-on AX bundle
