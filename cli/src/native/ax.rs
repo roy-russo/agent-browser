@@ -13,14 +13,15 @@
 #[cfg(target_os = "macos")]
 mod imp {
     use accessibility_sys::{
-        kAXChildrenAttribute, kAXDescriptionAttribute, kAXFocusedAttribute,
+        error_string, kAXChildrenAttribute, kAXDescriptionAttribute, kAXFocusedAttribute,
         kAXFocusedUIElementAttribute, kAXHelpAttribute, kAXMainAttribute, kAXParentAttribute,
         kAXPickAction, kAXPositionAttribute, kAXPressAction, kAXRoleAttribute,
         kAXSelectedAttribute, kAXSizeAttribute, kAXSubroleAttribute, kAXTitleAttribute,
         kAXValueAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
         AXIsProcessTrusted, AXUIElementCopyActionNames, AXUIElementCopyAttributeValue,
-        AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementPerformAction,
-        AXUIElementRef, AXValueGetValue, AXValueRef,
+        AXUIElementCreateApplication, AXUIElementCreateSystemWide,
+        AXUIElementIsAttributeSettable, AXUIElementPerformAction, AXUIElementRef,
+        AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
     };
     use core_foundation::{
         array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef},
@@ -605,6 +606,182 @@ mod imp {
         Ok(report)
     }
 
+    /// True if `attr` is currently settable on `el`. False on any error.
+    fn ax_is_settable(el: AXUIElementRef, attr: &str) -> bool {
+        unsafe {
+            let key = cfstr(attr);
+            let mut out: u8 = 0;
+            let err =
+                AXUIElementIsAttributeSettable(el, key.as_concrete_TypeRef(), &mut out as *mut u8);
+            err == 0 && out != 0
+        }
+    }
+
+    /// Resolve the focused text-shaped element. Tries kAXFocusedUIElement on the
+    /// app first; if it returns a non-text element (some sites wrap the input
+    /// in an AXGroup that ends up reported as focused), walks the windows tree
+    /// for the first AXTextField / AXTextArea / element-with-AXSecureTextField-
+    /// subrole that has kAXFocused = true. Mirrors probe.swift's
+    /// `findFocusedTextFieldInTree` workaround.
+    fn focused_text_field(app: AXUIElementRef) -> Option<AxElement> {
+        if let Some(c) = ax_element_attr(app, kAXFocusedUIElementAttribute) {
+            let role = ax_str(c.0, kAXRoleAttribute);
+            let subrole = ax_str(c.0, kAXSubroleAttribute);
+            if matches!(role.as_str(), "AXTextField" | "AXTextArea")
+                || subrole == "AXSecureTextField"
+            {
+                return Some(c);
+            }
+        }
+        let mut found: Option<AxElement> = None;
+        fn walk(el: AXUIElementRef, depth: usize, found: &mut Option<AxElement>) {
+            if depth > 20 || found.is_some() {
+                return;
+            }
+            let role = ax_str(el, kAXRoleAttribute);
+            let subrole = ax_str(el, kAXSubroleAttribute);
+            if matches!(role.as_str(), "AXTextField" | "AXTextArea")
+                || subrole == "AXSecureTextField"
+            {
+                if ax_bool(el, kAXFocusedAttribute) {
+                    unsafe { CFRetain(el as CFTypeRef) };
+                    *found = Some(AxElement(el));
+                }
+                return;
+            }
+            for c in ax_children(el) {
+                walk(c.0, depth + 1, found);
+            }
+        }
+        let wins = ax_element_array(app, kAXWindowsAttribute);
+        for w in &wins {
+            walk(w.0, 0, &mut found);
+            if found.is_some() {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Set `kAXValueAttribute` to `text` on the focused text-shaped element of
+    /// the Chrome at `pid`. Returns a JSON report mirroring probe.swift's
+    /// `--write-focused-tf` mode: target role/subrole/title, settable bit,
+    /// AXError code + name, value-before / value-after, and a `value_changed`
+    /// indicator. For `AXSecureTextField` (password fields), `value_after` is
+    /// reported as Apple's bullet obfuscation (`••••...`) — the real DOM value
+    /// is what landed; verify via CDP if confirmation is needed.
+    ///
+    /// Pre-conditions: Chrome must have renderer accessibility activated
+    /// (`--force-renderer-accessibility` or `AXEnhancedUserInterface = true`),
+    /// and the input must be focused. AXSetValue dispatches DOM `input` +
+    /// `change` events but not `beforeinput`/keydown/composition — see
+    /// SUBSTRATE.md "AXSetValue finding".
+    pub fn set_focused_value(pid: i32, text: &str, settle_ms: u64) -> Result<Value, String> {
+        if !is_trusted() {
+            return Err(
+                "Accessibility permission required. Grant in System Settings → Privacy & \
+                 Security → Accessibility for this binary, then retry."
+                    .into(),
+            );
+        }
+
+        let app_raw = unsafe { AXUIElementCreateApplication(pid as accessibility_sys::pid_t) };
+        let app = unsafe { AxElement::from_create(app_raw) }
+            .ok_or_else(|| format!("AXUIElementCreateApplication returned null for pid {pid}"))?;
+
+        let target = focused_text_field(app.0).ok_or_else(|| {
+            "no focused text-shaped element. Click or focus the input first.".to_string()
+        })?;
+
+        let role = ax_str(target.0, kAXRoleAttribute);
+        let subrole = ax_str(target.0, kAXSubroleAttribute);
+        let title = ax_str(target.0, kAXTitleAttribute);
+        let value_before = ax_str(target.0, kAXValueAttribute);
+        let settable = ax_is_settable(target.0, kAXValueAttribute);
+
+        let mut report = json!({
+            "role": role,
+            "subrole": subrole,
+            "title": title,
+            "value_before": value_before,
+            "value_settable": settable,
+        });
+        if !settable {
+            report["wrote"] = json!(false);
+            report["error"] = json!("kAXValueAttribute is not settable on the focused element");
+            return Ok(report);
+        }
+
+        let attr_cf = cfstr(kAXValueAttribute);
+        let value_cf = CFString::new(text);
+        let err = unsafe {
+            AXUIElementSetAttributeValue(
+                target.0,
+                attr_cf.as_concrete_TypeRef(),
+                value_cf.as_concrete_TypeRef() as CFTypeRef,
+            )
+        };
+
+        // Chrome propagates the value asynchronously: AX → Blink → DOM → AX
+        // round-trip lands ~10–50ms after the set returns. Settle before
+        // the readback so value_after reflects landed state.
+        if settle_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+        }
+        let value_after = ax_str(target.0, kAXValueAttribute);
+        let secure = subrole == "AXSecureTextField";
+        // Secure fields obscure the real value with bullet chars on read; the
+        // best signal we have post-write is "length matches and changed".
+        let value_changed = if secure {
+            value_after.chars().count() == text.chars().count() && value_after != value_before
+        } else {
+            value_after == text && value_after != value_before
+        };
+
+        report["error_raw"] = json!(err as i64);
+        report["error_name"] = json!(error_string(err));
+        report["wrote"] = json!(err == 0);
+        report["value_after"] = json!(value_after);
+        report["value_changed"] = json!(value_changed);
+        Ok(report)
+    }
+
+    /// Set the informal `AXEnhancedUserInterface` attribute on Chrome's app
+    /// element. The set itself returns `kAXErrorNotImplemented` (-25208) — Apple
+    /// doesn't document this attribute and Chromium doesn't formally accept the
+    /// write — but Chromium picks the activity up as an AT-detection signal and
+    /// activates renderer accessibility as a side effect. Use this on attach
+    /// (Mode A) to flip on web-content AX without `--force-renderer-accessibility`.
+    /// See SUBSTRATE.md "AX deep dive Q3".
+    pub fn enable_enhanced_user_interface(pid: i32) -> Result<Value, String> {
+        if !is_trusted() {
+            return Err(
+                "Accessibility permission required. Grant in System Settings → Privacy & \
+                 Security → Accessibility for this binary, then retry."
+                    .into(),
+            );
+        }
+        let app_raw = unsafe { AXUIElementCreateApplication(pid as accessibility_sys::pid_t) };
+        let app = unsafe { AxElement::from_create(app_raw) }
+            .ok_or_else(|| format!("AXUIElementCreateApplication returned null for pid {pid}"))?;
+        let attr_cf = cfstr("AXEnhancedUserInterface");
+        let err = unsafe {
+            AXUIElementSetAttributeValue(
+                app.0,
+                attr_cf.as_concrete_TypeRef(),
+                CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef,
+            )
+        };
+        // Apple-spec error is expected (kAXErrorNotImplemented) — the side
+        // effect is what we care about. Report the code so callers can log it.
+        Ok(json!({
+            "pid": pid,
+            "error_raw": err as i64,
+            "error_name": error_string(err),
+            "side_effect": "Chromium should activate renderer AX in response.",
+        }))
+    }
+
     /// Best-effort PID detection: scan for a Chrome process with
     /// `--remote-debugging-port=9222`. Mirrors chrome-step.mjs heuristic;
     /// avoids dragging in NSRunningApplication for now.
@@ -695,7 +872,10 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{detect_chrome_pid, focused_snapshot, hid_click, press_popup_item};
+pub use imp::{
+    detect_chrome_pid, enable_enhanced_user_interface, focused_snapshot, hid_click,
+    press_popup_item, set_focused_value,
+};
 
 #[cfg(not(target_os = "macos"))]
 pub fn focused_snapshot(_pid: i32) -> Result<serde_json::Value, String> {
@@ -709,6 +889,16 @@ pub fn detect_chrome_pid() -> Option<i32> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn hid_click(_x: f64, _y: f64) {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_focused_value(_pid: i32, _text: &str, _settle_ms: u64) -> Result<serde_json::Value, String> {
+    Err("AX set-value is only available on macOS".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn enable_enhanced_user_interface(_pid: i32) -> Result<serde_json::Value, String> {
+    Err("AXEnhancedUserInterface is only available on macOS".into())
+}
 
 #[cfg(not(target_os = "macos"))]
 pub fn press_popup_item(

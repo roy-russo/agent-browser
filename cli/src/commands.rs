@@ -1828,6 +1828,62 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(payload)
         }
 
+        // ax-set-value — write kAXValueAttribute on the focused text-shaped
+        // element via Mach-IPC. Bypasses the autofill picker entirely. Works
+        // on AXTextField + AXSecureTextField (password). Dispatches DOM input
+        // + change events; not beforeinput / keydown / composition. See
+        // SUBSTRATE.md "AXSetValue finding".
+        //
+        //   ax-set-value <text>                  — shorthand
+        //   ax-set-value --text <text>           — explicit
+        "ax-set-value" | "ax_set_value" => {
+            let mut text: Option<String> = None;
+            let mut settle_ms: Option<i64> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--text" => {
+                        i += 1;
+                        text = rest.get(i).map(|s| s.to_string());
+                    }
+                    "--settle-ms" => {
+                        i += 1;
+                        settle_ms = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    other if !other.starts_with("--") && text.is_none() => {
+                        text = Some(other.to_string());
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let text = text.ok_or(ParseError::MissingArguments {
+                context: "ax-set-value".to_string(),
+                usage: "ax-set-value <text> [--settle-ms <N>]  |  ax-set-value --text <text>",
+            })?;
+            let mut payload = json!({
+                "id": id,
+                "action": "ax_set_value",
+                "text": text,
+            });
+            if let Some(s) = settle_ms {
+                payload["settle_ms"] = json!(s);
+            }
+            Ok(payload)
+        }
+
+        // ax-enhance — set AXEnhancedUserInterface on Chrome's app element.
+        // Chromium picks this up as an AT-detection signal and turns on
+        // renderer accessibility, surfacing page <input> elements in the
+        // AX tree. Use on attach (Mode A) when the Chrome was not launched
+        // with --force-renderer-accessibility. Apple-spec error
+        // (kAXErrorNotImplemented) is expected — the side effect is what
+        // matters. See SUBSTRATE.md "AX deep dive Q3".
+        "ax-enhance" | "ax_enhance" => Ok(json!({
+            "id": id,
+            "action": "ax_enhance",
+        })),
+
         _ => Err(ParseError::UnknownCommand {
             command: cmd.to_string(),
         }),

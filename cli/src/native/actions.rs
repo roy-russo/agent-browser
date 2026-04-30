@@ -1447,6 +1447,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "ax_snapshot" => handle_ax_snapshot(cmd).await,
         "ax_click" => handle_ax_click(cmd, state).await,
         "ax_press" => handle_ax_press(cmd).await,
+        "ax_set_value" => handle_ax_set_value(cmd).await,
+        "ax_enhance" => handle_ax_enhance(cmd).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
@@ -8310,6 +8312,70 @@ async fn handle_ax_press(cmd: &Value) -> Result<Value, String> {
 #[cfg(not(target_os = "macos"))]
 async fn handle_ax_press(_cmd: &Value) -> Result<Value, String> {
     Err("ax-press is only available on macOS".into())
+}
+
+// ---------------------------------------------------------------------------
+// AX set-value — Mach-IPC write of kAXValueAttribute on the focused
+// text-shaped element. Bypasses the autofill picker; dispatches DOM input +
+// change events. Works on AXTextField and AXSecureTextField (password).
+// Pre-conditions: renderer AX active (--force-renderer-accessibility OR
+// AXEnhancedUserInterface = true via `ax-enhance`) and the input focused
+// (CDP click, DOM .focus(), or AX kAXFocused write all qualify).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+async fn handle_ax_set_value(cmd: &Value) -> Result<Value, String> {
+    let pid = resolve_ax_pid(cmd).ok_or_else(|| {
+        "Chrome PID not found. Pass --ax-pid <N> or ensure Chrome is running with \
+         --remote-debugging-port=9222."
+            .to_string()
+    })?;
+
+    let text = cmd
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or("ax-set-value needs <text> or --text <text>")?;
+
+    let settle_ms = cmd
+        .get("settle_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(120) as u64;
+
+    let mut result = super::ax::set_focused_value(pid, text, settle_ms)?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("pid".to_string(), json!(pid));
+        obj.insert("settled_ms".to_string(), json!(settle_ms));
+    }
+    Ok(result)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn handle_ax_set_value(_cmd: &Value) -> Result<Value, String> {
+    Err("ax-set-value is only available on macOS".into())
+}
+
+// ---------------------------------------------------------------------------
+// AX enhance — flip AXEnhancedUserInterface on Chrome's app element. The
+// AXSetAttributeValue itself returns kAXErrorNotImplemented (Apple-spec) but
+// Chromium picks the activity up as an AT-detection signal and turns on
+// renderer accessibility as a side effect. Surfaces page <input> elements
+// in the AX tree without --force-renderer-accessibility on the launch.
+// Use on attach (Mode A — user-launched Chrome).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+async fn handle_ax_enhance(cmd: &Value) -> Result<Value, String> {
+    let pid = resolve_ax_pid(cmd).ok_or_else(|| {
+        "Chrome PID not found. Pass --ax-pid <N> or ensure Chrome is running with \
+         --remote-debugging-port=9222."
+            .to_string()
+    })?;
+    super::ax::enable_enhanced_user_interface(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn handle_ax_enhance(_cmd: &Value) -> Result<Value, String> {
+    Err("ax-enhance is only available on macOS".into())
 }
 
 // ---------------------------------------------------------------------------
