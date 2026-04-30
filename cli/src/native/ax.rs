@@ -14,12 +14,13 @@
 mod imp {
     use accessibility_sys::{
         kAXChildrenAttribute, kAXDescriptionAttribute, kAXFocusedAttribute,
-        kAXFocusedUIElementAttribute, kAXHelpAttribute, kAXMainAttribute,
-        kAXPositionAttribute, kAXRoleAttribute, kAXSelectedAttribute, kAXSizeAttribute,
-        kAXSubroleAttribute, kAXTitleAttribute, kAXValueAttribute, kAXValueTypeCGPoint,
-        kAXValueTypeCGSize, kAXWindowsAttribute, AXIsProcessTrusted, AXUIElementCopyAttributeValue,
-        AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementRef, AXValueGetValue,
-        AXValueRef,
+        kAXFocusedUIElementAttribute, kAXHelpAttribute, kAXMainAttribute, kAXParentAttribute,
+        kAXPickAction, kAXPositionAttribute, kAXPressAction, kAXRoleAttribute,
+        kAXSelectedAttribute, kAXSizeAttribute, kAXSubroleAttribute, kAXTitleAttribute,
+        kAXValueAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
+        AXIsProcessTrusted, AXUIElementCopyActionNames, AXUIElementCopyAttributeValue,
+        AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementPerformAction,
+        AXUIElementRef, AXValueGetValue, AXValueRef,
     };
     use core_foundation::{
         array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef},
@@ -407,6 +408,203 @@ mod imp {
         }))
     }
 
+    /// Reads the action names supported by an AXUIElement. Empty on failure.
+    fn ax_action_names(el: AXUIElementRef) -> Vec<String> {
+        unsafe {
+            let mut out: CFArrayRef = std::ptr::null();
+            let err = AXUIElementCopyActionNames(el, &mut out);
+            if err != 0 || out.is_null() {
+                return Vec::new();
+            }
+            let count = CFArrayGetCount(out);
+            let mut names = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let raw = CFArrayGetValueAtIndex(out, i) as CFStringRef;
+                if !raw.is_null() {
+                    let cf = CFString::wrap_under_get_rule(raw);
+                    names.push(cf.to_string());
+                }
+            }
+            CFRelease(out as CFTypeRef);
+            names
+        }
+    }
+
+    /// Walks ancestors (up to `max_hops`) looking for an element that supports
+    /// `AXPress` or `AXPick`. Returns (element, action_name) or None.
+    /// Picker AXStaticText items hold AXPress directly in our reproductions, but
+    /// we keep the walk for future picker shapes that might wrap items.
+    fn find_press_target(start: AxElement, max_hops: usize) -> Option<(AxElement, String)> {
+        let mut current = Some(start);
+        for _ in 0..=max_hops {
+            let el = current.take()?;
+            let actions = ax_action_names(el.0);
+            if actions.iter().any(|a| a == kAXPressAction) {
+                return Some((el, kAXPressAction.to_string()));
+            }
+            if actions.iter().any(|a| a == kAXPickAction) {
+                return Some((el, kAXPickAction.to_string()));
+            }
+            current = ax_element_attr(el.0, kAXParentAttribute);
+        }
+        None
+    }
+
+    /// Walks Chrome's window tree and returns the AXUIElement of the AXList
+    /// (or other popup-shape) at the given index. Dedup matches `find_popups` —
+    /// same widget at same screen coords is the same popup.
+    fn popup_ax_list_at_index(app: AXUIElementRef, index: usize) -> Option<AxElement> {
+        let mut found: Vec<(AxElement, String)> = Vec::new();
+
+        fn walk(el: AXUIElementRef, depth: usize, found: &mut Vec<(AxElement, String)>) {
+            if depth > MAX_WALK_DEPTH {
+                return;
+            }
+            let role = ax_str(el, kAXRoleAttribute);
+            if role == "AXWebArea" {
+                return;
+            }
+            if is_popup_shape(el) {
+                let mut key = role.clone();
+                if let (Some(p), Some(s)) = (
+                    ax_point(el, kAXPositionAttribute),
+                    ax_size(el, kAXSizeAttribute),
+                ) {
+                    key.push_str(&format!(
+                        "|{}|{}|{}|{}",
+                        p.x as i64, p.y as i64, s.width as i64, s.height as i64
+                    ));
+                }
+                // Take ownership of a +1 retain so the AxElement Drop can release.
+                unsafe { CFRetain(el as CFTypeRef) };
+                found.push((AxElement(el), key));
+                return; // don't recurse into popup
+            }
+            for c in ax_children(el) {
+                walk(c.0, depth + 1, found);
+            }
+        }
+
+        let wins = ax_element_array(app, kAXWindowsAttribute);
+        for w in &wins {
+            walk(w.0, 0, &mut found);
+        }
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut deduped: Vec<AxElement> = Vec::new();
+        for (el, key) in found {
+            if seen.insert(key) {
+                deduped.push(el);
+            }
+        }
+        if index < deduped.len() {
+            // Take the requested element; the rest drop normally.
+            Some(deduped.swap_remove(index))
+        } else {
+            None
+        }
+    }
+
+    /// Collect AXStaticText leaves under a popup AXList — the picker items.
+    /// Mirrors `collect_list_items`: AXStaticText only, no recurse into AXStaticText.
+    fn popup_item_elements(list: AXUIElementRef) -> Vec<AxElement> {
+        let mut items: Vec<AxElement> = Vec::new();
+        fn walk(el: AXUIElementRef, depth: usize, items: &mut Vec<AxElement>) {
+            if depth > MAX_LIST_DEPTH {
+                return;
+            }
+            if ax_str(el, kAXRoleAttribute) == "AXStaticText" {
+                unsafe { CFRetain(el as CFTypeRef) };
+                items.push(AxElement(el));
+                return;
+            }
+            for c in ax_children(el) {
+                walk(c.0, depth + 1, items);
+            }
+        }
+        walk(list, 0, &mut items);
+        items
+    }
+
+    /// Press the AXStaticText item at popups[popup_idx].items[item_idx] via
+    /// AXUIElementPerformAction. Returns a JSON report mirroring probe.swift's
+    /// `--press` mode: target element, actions found, error code, success bit.
+    ///
+    /// AXPress is a Mach-IPC message into Chrome's accessibility action handler
+    /// — it does NOT synthesize a mouse event. Works regardless of foreground
+    /// state and sidesteps the CDP-input-trust silent-fill issue that motivates
+    /// `hid_click`.
+    pub fn press_popup_item(pid: i32, popup_idx: usize, item_idx: usize) -> Result<Value, String> {
+        if !is_trusted() {
+            return Err(
+                "Accessibility permission required. Grant in System Settings → Privacy & \
+                 Security → Accessibility for this binary, then retry."
+                    .into(),
+            );
+        }
+
+        let app_raw = unsafe { AXUIElementCreateApplication(pid as accessibility_sys::pid_t) };
+        let app = unsafe { AxElement::from_create(app_raw) }
+            .ok_or_else(|| format!("AXUIElementCreateApplication returned null for pid {pid}"))?;
+
+        let list = popup_ax_list_at_index(app.0, popup_idx)
+            .ok_or_else(|| format!("popup index {} not found", popup_idx))?;
+        let popup_role = ax_str(list.0, kAXRoleAttribute);
+        let popup_actions = ax_action_names(list.0);
+
+        let items = popup_item_elements(list.0);
+        let item_count = items.len();
+        if item_idx >= item_count {
+            return Err(format!(
+                "item index {} out of range ({} items)",
+                item_idx, item_count
+            ));
+        }
+        let mut items_iter = items.into_iter();
+        let item = items_iter.nth(item_idx).expect("bounds checked above");
+
+        let item_role = ax_str(item.0, kAXRoleAttribute);
+        let item_value = ax_str(item.0, kAXValueAttribute);
+        let item_actions = ax_action_names(item.0);
+
+        // Walk to the nearest element supporting AXPress/AXPick (item itself
+        // qualifies in the Chrome autofill picker case).
+        let target = find_press_target(item, 6);
+        let mut report = json!({
+            "popup_role": popup_role,
+            "popup_actions": popup_actions,
+            "item_count": item_count,
+            "item_role": item_role,
+            "item_value": item_value,
+            "item_actions": item_actions,
+        });
+
+        match target {
+            Some((target_el, action)) => {
+                let target_role = ax_str(target_el.0, kAXRoleAttribute);
+                let target_actions = ax_action_names(target_el.0);
+                let action_cf = CFString::new(&action);
+                let err = unsafe {
+                    AXUIElementPerformAction(target_el.0, action_cf.as_concrete_TypeRef())
+                };
+                report["target_role"] = json!(target_role);
+                report["target_actions"] = json!(target_actions);
+                report["action_used"] = json!(action);
+                report["error_raw"] = json!(err as i64);
+                report["pressed"] = json!(err == 0);
+                if err != 0 {
+                    report["error"] = json!(format!("AXUIElementPerformAction returned {}", err));
+                }
+            }
+            None => {
+                report["pressed"] = json!(false);
+                report["error"] = json!("No AXPress/AXPick action found on item or any ancestor (up 6 hops)");
+            }
+        }
+
+        Ok(report)
+    }
+
     /// Best-effort PID detection: scan for a Chrome process with
     /// `--remote-debugging-port=9222`. Mirrors chrome-step.mjs heuristic;
     /// avoids dragging in NSRunningApplication for now.
@@ -497,7 +695,7 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{detect_chrome_pid, focused_snapshot, hid_click};
+pub use imp::{detect_chrome_pid, focused_snapshot, hid_click, press_popup_item};
 
 #[cfg(not(target_os = "macos"))]
 pub fn focused_snapshot(_pid: i32) -> Result<serde_json::Value, String> {
@@ -511,3 +709,12 @@ pub fn detect_chrome_pid() -> Option<i32> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn hid_click(_x: f64, _y: f64) {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn press_popup_item(
+    _pid: i32,
+    _popup_idx: usize,
+    _item_idx: usize,
+) -> Result<serde_json::Value, String> {
+    Err("AX press is only available on macOS".into())
+}

@@ -1446,6 +1446,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "mouseup" => handle_mouseup(cmd, state).await,
         "ax_snapshot" => handle_ax_snapshot(cmd).await,
         "ax_click" => handle_ax_click(cmd, state).await,
+        "ax_press" => handle_ax_press(cmd).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
@@ -8256,6 +8257,59 @@ async fn handle_ax_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 #[cfg(not(target_os = "macos"))]
 async fn handle_ax_click(_cmd: &Value, _state: &mut DaemonState) -> Result<Value, String> {
     Err("ax-click is only available on macOS".into())
+}
+
+// ---------------------------------------------------------------------------
+// AX press — Mach-IPC commit on a Chrome popup item. Sidesteps HID-tap by
+// calling AXUIElementPerformAction(item, kAXPressAction) directly. Works
+// regardless of foreground state and ignores Chrome's CDP-input-trust
+// silent-fill heuristic. Address by `popup:item` index — these come straight
+// from the bundled `ax.popups[i].items[j]` shape on prior responses.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+async fn handle_ax_press(cmd: &Value) -> Result<Value, String> {
+    let pid = resolve_ax_pid(cmd).ok_or_else(|| {
+        "Chrome PID not found. Pass --ax-pid <N> or ensure Chrome is running with \
+         --remote-debugging-port=9222."
+            .to_string()
+    })?;
+
+    let popup_idx = cmd
+        .get("popup")
+        .and_then(|v| v.as_i64())
+        .ok_or("ax-press needs --popup <N>")? as usize;
+    let item_idx = cmd
+        .get("item")
+        .and_then(|v| v.as_i64())
+        .ok_or("ax-press needs --item <N>")? as usize;
+
+    let mut result = super::ax::press_popup_item(pid, popup_idx, item_idx)?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("pid".to_string(), json!(pid));
+        obj.insert("popup".to_string(), json!(popup_idx));
+        obj.insert("item".to_string(), json!(item_idx));
+    }
+
+    // Settle window: AXPress returns immediately, but Chrome dismisses the
+    // picker AXWindow + commits the autofill on the next event-loop tick.
+    // Wait so the default-on AX bundle captures post-press state.
+    let settle_ms = cmd
+        .get("settle_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(220) as u64;
+    tokio::time::sleep(tokio::time::Duration::from_millis(settle_ms)).await;
+
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("settled_ms".to_string(), json!(settle_ms));
+    }
+
+    Ok(result)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn handle_ax_press(_cmd: &Value) -> Result<Value, String> {
+    Err("ax-press is only available on macOS".into())
 }
 
 // ---------------------------------------------------------------------------

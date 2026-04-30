@@ -1765,6 +1765,69 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(payload)
         }
 
+        // === AX press (macOS) ===
+        // AX-protocol commit on a Chrome popup item — Mach-IPC into Chrome's
+        // accessibility action handler, no input synthesis. Sidesteps the
+        // CDP-input-trust silent-fill heuristic and works on backgrounded
+        // Chrome. Address by index — pair with ax-snapshot or any auto-AX-
+        // bundled response: ax.popups[popup].items[item].
+        //
+        //   ax-press <popup>:<item>           — shorthand (probe.swift parity)
+        //   ax-press --popup <N> --item <N>   — explicit
+        "ax-press" | "ax_press" => {
+            let mut popup: Option<i64> = None;
+            let mut item: Option<i64> = None;
+            let mut settle_ms: Option<i64> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--popup" => {
+                        i += 1;
+                        popup = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    "--item" => {
+                        i += 1;
+                        item = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    "--settle-ms" => {
+                        i += 1;
+                        settle_ms = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    other if !other.starts_with("--") && (popup.is_none() || item.is_none()) => {
+                        // Shorthand: <popup>:<item>
+                        if let Some((p, m)) = other.split_once(':') {
+                            popup = popup.or_else(|| p.parse::<i64>().ok());
+                            item = item.or_else(|| m.parse::<i64>().ok());
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            let popup = popup.ok_or(ParseError::MissingArguments {
+                context: "ax-press".to_string(),
+                usage:
+                    "ax-press <popup>:<item>  |  ax-press --popup <N> --item <N> [--settle-ms <N>]",
+            })?;
+            let item = item.ok_or(ParseError::MissingArguments {
+                context: "ax-press".to_string(),
+                usage:
+                    "ax-press <popup>:<item>  |  ax-press --popup <N> --item <N> [--settle-ms <N>]",
+            })?;
+
+            let mut payload = json!({
+                "id": id,
+                "action": "ax_press",
+                "popup": popup,
+                "item": item,
+            });
+            if let Some(s) = settle_ms {
+                payload["settle_ms"] = json!(s);
+            }
+            Ok(payload)
+        }
+
         _ => Err(ParseError::UnknownCommand {
             command: cmd.to_string(),
         }),
