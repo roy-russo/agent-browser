@@ -27,7 +27,7 @@ mod imp {
         array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef},
         base::{CFGetTypeID, CFRelease, CFTypeID, CFTypeRef, TCFType},
         boolean::{CFBoolean, CFBooleanGetTypeID, CFBooleanRef},
-        string::{CFString, CFStringRef},
+        string::{CFString, CFStringGetTypeID, CFStringRef},
     };
     use core_graphics_types::geometry::{CGPoint, CGSize};
     use serde_json::{json, Map, Value};
@@ -65,7 +65,7 @@ mod imp {
         CFString::new(name)
     }
 
-    /// Reads a string attribute. Returns "" on any failure.
+    /// Reads a string attribute. Returns "" on any failure or non-string result.
     fn ax_str(el: AXUIElementRef, attr: &str) -> String {
         unsafe {
             let key = cfstr(attr);
@@ -74,7 +74,17 @@ mod imp {
             if err != 0 || out.is_null() {
                 return String::new();
             }
-            // Verify it's a CFString before downcasting.
+            // Type-check before downcasting. Some AX attributes return non-string
+            // CFTypes for elements that conceptually shouldn't have a string at
+            // that key — e.g. AXHeading.kAXValueAttribute returns a CFNumber
+            // (heading level), AXSlider.kAXValueAttribute returns a CFNumber.
+            // A blind CFString::to_string on the wrong CFType throws an Obj-C
+            // NSException, which Rust can't unwind through; the daemon aborts
+            // with `fatal runtime error: Rust cannot catch foreign exceptions`.
+            if CFGetTypeID(out) != CFStringGetTypeID() {
+                CFRelease(out);
+                return String::new();
+            }
             let s_ref: CFStringRef = out as CFStringRef;
             let cf = CFString::wrap_under_create_rule(s_ref);
             cf.to_string()
