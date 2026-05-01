@@ -746,6 +746,135 @@ mod imp {
         Ok(report)
     }
 
+    /// Walk Chrome's window tree to find the first AXButton whose label
+    /// (title / description / value / help — first match wins) equals
+    /// `target_title`. Returns the element with a +1 retain for the caller to
+    /// drop. Skips AXWebArea subtrees (page DOM is reachable via CDP — AX adds
+    /// noise inside web views and slows the walk).
+    ///
+    /// Chromium puts visible browser-chrome button labels in
+    /// `kAXDescriptionAttribute`, not `kAXTitleAttribute` (cross-platform
+    /// consistency convention — see _pro2/AX-CHROME-MODAL-SHAPES.md Q2). We
+    /// check all four candidate attributes so callers can pass the visible
+    /// label as they see it without knowing which attr Chromium used.
+    fn find_button_by_title(app: AXUIElementRef, title: &str) -> Option<AxElement> {
+        fn walk(el: AXUIElementRef, title: &str, depth: usize) -> Option<AxElement> {
+            if depth > MAX_WALK_DEPTH {
+                return None;
+            }
+            let role = ax_str(el, kAXRoleAttribute);
+            if role == "AXWebArea" {
+                return None;
+            }
+            if role == "AXButton" {
+                let candidates = [
+                    ax_str(el, kAXTitleAttribute),
+                    ax_str(el, kAXDescriptionAttribute),
+                    ax_str(el, kAXValueAttribute),
+                    ax_str(el, kAXHelpAttribute),
+                ];
+                if candidates.iter().any(|c| c == title) {
+                    unsafe { CFRetain(el as CFTypeRef) };
+                    return Some(AxElement(el));
+                }
+            }
+            for c in ax_children(el) {
+                if let Some(found) = walk(c.0, title, depth + 1) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let wins = ax_element_array(app, kAXWindowsAttribute);
+        for w in &wins {
+            if let Some(found) = walk(w.0, title, 0) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Press an AXButton by visible label, anywhere in Chrome's window tree.
+    /// Generalizes the picker-press path (kAXPressAction on AXStaticText
+    /// inside an AXList) to browser-chrome AXButton elements — needed because
+    /// Chrome modals (the "Protect passwords with your screen lock" sheet,
+    /// save-password infobar, password manager bubble, "Update password?",
+    /// WebAuthn modal, etc.) all expose AXButton with kAXPressAction but live
+    /// outside the autofill-popup filter that `press_popup_item` requires.
+    ///
+    /// Mach-IPC press, no input synthesis. Background-capable: Chrome doesn't
+    /// need to be the key window. Verified empirically against the screen-lock
+    /// onboarding "No, thanks" button and the toolbar "Manage your passwords"
+    /// key icon — both press cleanly with `error_raw = 0` while the user holds
+    /// focus in another app.
+    ///
+    /// `windows_before`/`windows_after` let the caller infer dialog dismissal
+    /// (count drops by 1 when a constrained-window or bubble closes).
+    pub fn press_button_by_title(
+        pid: i32,
+        title: &str,
+        settle_ms: u64,
+    ) -> Result<Value, String> {
+        if !is_trusted() {
+            return Err(
+                "Accessibility permission required. Grant in System Settings → Privacy & \
+                 Security → Accessibility for this binary, then retry."
+                    .into(),
+            );
+        }
+
+        let app_raw = unsafe { AXUIElementCreateApplication(pid as accessibility_sys::pid_t) };
+        let app = unsafe { AxElement::from_create(app_raw) }
+            .ok_or_else(|| format!("AXUIElementCreateApplication returned null for pid {pid}"))?;
+
+        let windows_before = ax_element_array(app.0, kAXWindowsAttribute).len();
+
+        let target = find_button_by_title(app.0, title).ok_or_else(|| {
+            format!(
+                "AXButton with label \"{}\" not found in any Chrome window. \
+                 (Checked title/desc/value/help across all windows, skipping AXWebArea.)",
+                title
+            )
+        })?;
+
+        let actions = ax_action_names(target.0);
+        let role = ax_str(target.0, kAXRoleAttribute);
+
+        if !actions.iter().any(|a| a == kAXPressAction) {
+            return Ok(json!({
+                "found": true,
+                "title": title,
+                "role": role,
+                "actions": actions,
+                "pressed": false,
+                "error": "AXPress action not exposed on the matched button",
+            }));
+        }
+
+        let action_cf = CFString::new(kAXPressAction);
+        let err = unsafe {
+            AXUIElementPerformAction(target.0, action_cf.as_concrete_TypeRef())
+        };
+
+        if settle_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+        }
+        let windows_after = ax_element_array(app.0, kAXWindowsAttribute).len();
+
+        Ok(json!({
+            "found": true,
+            "title": title,
+            "role": role,
+            "actions": actions,
+            "pressed": err == 0,
+            "error_raw": err as i64,
+            "error_name": error_string(err),
+            "windows_before": windows_before,
+            "windows_after": windows_after,
+            "settled_ms": settle_ms,
+        }))
+    }
+
     /// Set the informal `AXEnhancedUserInterface` attribute on Chrome's app
     /// element. The set itself returns `kAXErrorNotImplemented` (-25208) — Apple
     /// doesn't document this attribute and Chromium doesn't formally accept the
@@ -874,7 +1003,7 @@ mod imp {
 #[cfg(target_os = "macos")]
 pub use imp::{
     detect_chrome_pid, enable_enhanced_user_interface, focused_snapshot, hid_click,
-    press_popup_item, set_focused_value,
+    press_button_by_title, press_popup_item, set_focused_value,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -907,4 +1036,13 @@ pub fn press_popup_item(
     _item_idx: usize,
 ) -> Result<serde_json::Value, String> {
     Err("AX press is only available on macOS".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn press_button_by_title(
+    _pid: i32,
+    _title: &str,
+    _settle_ms: u64,
+) -> Result<serde_json::Value, String> {
+    Err("AX press-button is only available on macOS".into())
 }

@@ -1447,6 +1447,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "ax_snapshot" => handle_ax_snapshot(cmd).await,
         "ax_click" => handle_ax_click(cmd, state).await,
         "ax_press" => handle_ax_press(cmd).await,
+        "ax_press_button" => handle_ax_press_button(cmd).await,
         "ax_set_value" => handle_ax_set_value(cmd).await,
         "ax_enhance" => handle_ax_enhance(cmd).await,
         _ => Err(format!("Not yet implemented: {}", action)),
@@ -8352,6 +8353,45 @@ async fn handle_ax_set_value(cmd: &Value) -> Result<Value, String> {
 #[cfg(not(target_os = "macos"))]
 async fn handle_ax_set_value(_cmd: &Value) -> Result<Value, String> {
     Err("ax-set-value is only available on macOS".into())
+}
+
+// ---------------------------------------------------------------------------
+// AX press-button — Mach-IPC AXPress on any AXButton in Chrome's tree,
+// matched by visible label (title / desc / value / help — first match).
+// Generalizes ax-press from picker AXStaticText to browser-chrome AXButton:
+// dismiss "Protect passwords with your screen lock" sheet, click the toolbar
+// "Manage your passwords" key icon, press save-password infobar buttons,
+// confirm WebAuthn modals, etc. Background-capable.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+async fn handle_ax_press_button(cmd: &Value) -> Result<Value, String> {
+    let pid = resolve_ax_pid(cmd).ok_or_else(|| {
+        "Chrome PID not found. Pass --ax-pid <N> or ensure Chrome is running with \
+         --remote-debugging-port=9222."
+            .to_string()
+    })?;
+
+    let title = cmd
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or("ax-press-button needs <title> or --title <title>")?;
+
+    let settle_ms = cmd
+        .get("settle_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(220) as u64;
+
+    let mut result = super::ax::press_button_by_title(pid, title, settle_ms)?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("pid".to_string(), json!(pid));
+    }
+    Ok(result)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn handle_ax_press_button(_cmd: &Value) -> Result<Value, String> {
+    Err("ax-press-button is only available on macOS".into())
 }
 
 // ---------------------------------------------------------------------------

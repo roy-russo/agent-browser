@@ -1872,6 +1872,52 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(payload)
         }
 
+        // ax-press-button — Mach-IPC AXPress on any AXButton in Chrome's
+        // tree, matched by visible label. Generalizes ax-press from picker
+        // AXStaticText to browser-chrome AXButton: dismiss "Protect passwords
+        // with your screen lock" sheet, click toolbar key icon to open the
+        // password manager bubble, press save-password infobar buttons, etc.
+        // Background-capable; checks title / desc / value / help so callers
+        // pass the visible label. See SUBSTRATE.md "AX press generalization".
+        //
+        //   ax-press-button <title>                 — shorthand
+        //   ax-press-button --title <title>         — explicit
+        "ax-press-button" | "ax_press_button" => {
+            let mut title: Option<String> = None;
+            let mut settle_ms: Option<i64> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--title" => {
+                        i += 1;
+                        title = rest.get(i).map(|s| s.to_string());
+                    }
+                    "--settle-ms" => {
+                        i += 1;
+                        settle_ms = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    other if !other.starts_with("--") && title.is_none() => {
+                        title = Some(other.to_string());
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let title = title.ok_or(ParseError::MissingArguments {
+                context: "ax-press-button".to_string(),
+                usage: "ax-press-button <title> [--settle-ms <N>]  |  ax-press-button --title <title>",
+            })?;
+            let mut payload = json!({
+                "id": id,
+                "action": "ax_press_button",
+                "title": title,
+            });
+            if let Some(s) = settle_ms {
+                payload["settle_ms"] = json!(s);
+            }
+            Ok(payload)
+        }
+
         // ax-enhance — set AXEnhancedUserInterface on Chrome's app element.
         // Chromium picks this up as an AT-detection signal and turns on
         // renderer accessibility, surfacing page <input> elements in the
