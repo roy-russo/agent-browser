@@ -246,20 +246,38 @@ mod imp {
         d
     }
 
-    /// Popup detection: matches probe.swift verbatim.
-    /// AXList in browser chrome (we already skip AXWebArea, so any AXList
-    /// we encounter is browser-process UI) = popup. Chrome exposes the
+    /// Popup detection. Matches probe.swift's role/subrole criteria plus the
+    /// Chromium constrained-window / bubble shape we discovered after writing
+    /// it: every Chromium tab-modal dialog ("Protect passwords with your
+    /// screen lock", "Save password?", "Update password?", sign-in, WebAuthn,
+    /// permission prompts) and every anchored bubble (password manager,
+    /// bookmarks, page-info, downloads, profile menu) renders as a top-level
+    /// `AXWindow` with subrole `AXUnknown`. Chromium creates these as
+    /// borderless `NSWindow`s outside AppKit's standard sheet/dialog
+    /// machinery, so AppKit reports `AXUnknown`. The main browser window is
+    /// `AXStandardWindow`; DevTools is `AXFloatingWindow`; both safely skip
+    /// this rule. See _pro2/AX-CHROME-MODAL-SHAPES.md (Q1, Q3).
+    ///
+    /// AXList in browser chrome (we already skip AXWebArea, so any AXList we
+    /// encounter is browser-process UI) = popup. Chrome exposes the
     /// "Autofill" label via kAXDescriptionAttribute, NOT kAXTitleAttribute.
     fn is_popup_shape(el: AXUIElementRef) -> bool {
         let role = ax_str(el, kAXRoleAttribute);
         let subrole = ax_str(el, kAXSubroleAttribute);
-        matches!(
+        if matches!(
             role.as_str(),
             "AXMenu" | "AXSheet" | "AXPopover" | "AXSystemDialog" | "AXList"
         ) || matches!(
             subrole.as_str(),
             "AXSystemDialog" | "AXFloatingWindow" | "AXSystemFloatingWindow" | "AXDialog"
-        )
+        ) {
+            return true;
+        }
+        // Chromium constrained-window dialogs and anchored bubbles.
+        if role == "AXWindow" && subrole == "AXUnknown" {
+            return true;
+        }
+        false
     }
 
     fn collect_list_items(
