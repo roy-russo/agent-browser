@@ -1206,7 +1206,16 @@ fn main() {
                 .map(commands::shell_words_split)
                 .collect::<Vec<Vec<String>>>()
         });
-        run_batch(&flags, bail, arg_commands);
+        // Propagate AX-bundling flags into the per-batch-command path. The
+        // top-level CLI sets these on `cmd` from `--ax-pid` / `--no-ax`, but
+        // `parse_command` for inner commands doesn't see them. Without this
+        // pass-through, the daemon's `resolve_ax_pid` falls back to a 9222
+        // probe and misses Goodboy clones launched on OS-assigned ports —
+        // so no AX bundle ever lands in batch responses, even if the CLI
+        // result entry now carries `resp.ax`.
+        let ax_pid = cmd.get("ax_pid").and_then(|v| v.as_i64());
+        let no_ax = cmd.get("no_ax").and_then(|v| v.as_bool()).unwrap_or(false);
+        run_batch(&flags, bail, arg_commands, ax_pid, no_ax);
         return;
     }
 
@@ -1286,7 +1295,13 @@ fn main() {
     }
 }
 
-fn run_batch(flags: &Flags, bail: bool, arg_commands: Option<Vec<Vec<String>>>) {
+fn run_batch(
+    flags: &Flags,
+    bail: bool,
+    arg_commands: Option<Vec<Vec<String>>>,
+    ax_pid: Option<i64>,
+    no_ax: bool,
+) {
     let commands: Vec<Vec<String>> = if let Some(cmds) = arg_commands {
         cmds
     } else {
@@ -1339,7 +1354,7 @@ fn run_batch(flags: &Flags, bail: bool, arg_commands: Option<Vec<Vec<String>>>) 
             continue;
         }
 
-        let parsed = match parse_command(cmd_args, flags) {
+        let mut parsed = match parse_command(cmd_args, flags) {
             Ok(c) => c,
             Err(e) => {
                 had_error = true;
@@ -1367,6 +1382,17 @@ fn run_batch(flags: &Flags, bail: bool, arg_commands: Option<Vec<Vec<String>>>) 
             }
         };
 
+        // Inject batch-level AX flags into each inner command. Mirrors the
+        // top-level wiring at the batch dispatch site.
+        if let Some(obj) = parsed.as_object_mut() {
+            if no_ax {
+                obj.insert("no_ax".to_string(), json!(true));
+            }
+            if let Some(pid) = ax_pid {
+                obj.insert("ax_pid".to_string(), json!(pid));
+            }
+        }
+
         let action = parsed
             .get("action")
             .and_then(|v| v.as_str())
@@ -1375,12 +1401,23 @@ fn run_batch(flags: &Flags, bail: bool, arg_commands: Option<Vec<Vec<String>>>) 
         match send_command(parsed, &flags.session) {
             Ok(resp) => {
                 if flags.json {
-                    results.push(json!({
+                    // Preserve the AX bundle the daemon attached per-action.
+                    // Without this pass-through, the batch CLI dropped `resp.ax`
+                    // and callers had to fall back to single-command flows for
+                    // picker observation. Mirrors the single-command shape
+                    // (Response::ax → top-level "ax" key, omitted when None).
+                    let mut entry = json!({
                         "command": cmd_args,
                         "success": resp.success,
                         "result": resp.data,
                         "error": resp.error,
-                    }));
+                    });
+                    if let Some(ax) = resp.ax {
+                        if let Some(obj) = entry.as_object_mut() {
+                            obj.insert("ax".to_string(), ax);
+                        }
+                    }
+                    results.push(entry);
                 } else {
                     if i > 0 {
                         println!();
