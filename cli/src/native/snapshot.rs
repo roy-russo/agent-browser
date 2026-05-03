@@ -6,7 +6,7 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AXNode, AXProperty, AXValue, EvaluateParams, EvaluateResult, GetFullAXTreeResult,
 };
-use super::element::{resolve_ax_session, RefMap};
+use super::element::{resolve_ax_session, RefAttrs, RefMap};
 
 const INTERACTIVE_ROLES: &[&str] = &[
     "button",
@@ -81,6 +81,13 @@ pub struct SnapshotOptions {
     pub compact: bool,
     pub depth: Option<usize>,
     pub urls: bool,
+    /// When true, fold DOM attributes (`id`, `class`, `title`,
+    /// `aria-label`, plus `type`/`autocomplete` for inputs) onto each
+    /// ref-bearing interactive node. Costs one CDP round-trip per
+    /// targeted node, batched in parallel. Off by default for parity
+    /// with upstream; turn on when the consumer needs to disambiguate
+    /// elements that share an accessible name.
+    pub attrs: bool,
 }
 
 struct TreeNode {
@@ -477,6 +484,132 @@ pub async fn take_snapshot(
             for (idx, href) in hrefs {
                 if let Some(url) = href {
                     tree_nodes[idx].url = Some(url);
+                }
+            }
+        }
+    }
+
+    // --attrs: fold per-element DOM attributes onto interactive refs so
+    // agents can disambiguate elements that share an accessible name
+    // (e.g. two "Accept All Cookies" buttons where only `class` differs).
+    // Mirrors the --urls fetch shape: parallel resolveNode → callFunctionOn.
+    if options.attrs {
+        const ATTR_ROLES: &[&str] = &[
+            "button",
+            "link",
+            "textbox",
+            "searchbox",
+            "combobox",
+            "checkbox",
+            "radio",
+            "switch",
+            "menuitem",
+            "menuitemcheckbox",
+            "menuitemradio",
+            "spinbutton",
+            "slider",
+            "tab",
+        ];
+
+        let attr_nodes: Vec<(usize, i64)> = tree_nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                n.has_ref
+                    && n.backend_node_id.is_some()
+                    && ATTR_ROLES.contains(&n.role.as_str())
+            })
+            .filter_map(|(i, n)| n.backend_node_id.map(|bid| (i, bid)))
+            .collect();
+
+        if !attr_nodes.is_empty() {
+            // Phase 1: resolve backend node IDs to JS object IDs in parallel.
+            let resolve_futs = attr_nodes.iter().map(|&(idx, bid)| async move {
+                let resolved = client
+                    .send_command(
+                        "DOM.resolveNode",
+                        Some(serde_json::json!({ "backendNodeId": bid })),
+                        Some(session_id),
+                    )
+                    .await;
+                let obj_id = resolved.ok().and_then(|r| {
+                    r.get("object")
+                        .and_then(|o| o.get("objectId"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+                (idx, obj_id)
+            });
+            let resolved: Vec<(usize, Option<String>)> =
+                futures_util::future::join_all(resolve_futs).await;
+
+            // Phase 2: fetch attributes per object in parallel. Returns one
+            // JSON object per element with all six attrs (nullable).
+            // `className` is a string for HTMLElements but an SVGAnimatedString
+            // for SVG, hence the typeof guard. Empty strings collapse to null
+            // so the consumer sees absence as null, not "".
+            const ATTR_FN: &str = r#"function() {
+                var t = (this.tagName || '').toUpperCase();
+                var isInput = t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT';
+                var cn = null;
+                if (typeof this.className === 'string' && this.className) cn = this.className;
+                var ga = this.getAttribute ? this.getAttribute.bind(this) : function(){ return null; };
+                return {
+                    id: this.id || null,
+                    cn: cn,
+                    title: this.title || null,
+                    al: ga('aria-label') || null,
+                    ty: isInput ? (this.type || null) : null,
+                    ac: ga('autocomplete') || null
+                };
+            }"#;
+
+            let attr_futs: Vec<_> = resolved
+                .iter()
+                .filter_map(|(idx, obj_id)| {
+                    let oid = obj_id.as_ref()?;
+                    Some(async move {
+                        let result = client
+                            .send_command(
+                                "Runtime.callFunctionOn",
+                                Some(serde_json::json!({
+                                    "objectId": oid,
+                                    "functionDeclaration": ATTR_FN,
+                                    "returnByValue": true,
+                                })),
+                                Some(session_id),
+                            )
+                            .await;
+                        let value = result.ok().and_then(|r| {
+                            r.get("result")
+                                .and_then(|r| r.get("value"))
+                                .cloned()
+                        });
+                        (*idx, value)
+                    })
+                })
+                .collect();
+            let fetched: Vec<(usize, Option<Value>)> =
+                futures_util::future::join_all(attr_futs).await;
+
+            for (idx, value) in fetched {
+                let Some(v) = value else { continue };
+                let pick = |key: &str| -> Option<String> {
+                    v.get(key)
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                };
+                let attrs = RefAttrs {
+                    html_id: pick("id"),
+                    class_name: pick("cn"),
+                    title: pick("title"),
+                    aria_label: pick("al"),
+                    input_type: pick("ty"),
+                    autocomplete: pick("ac"),
+                };
+                if let Some(ref ref_id) = tree_nodes[idx].ref_id {
+                    ref_map.set_attrs(ref_id, attrs);
                 }
             }
         }

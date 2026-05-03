@@ -5,6 +5,16 @@ use serde_json::Value;
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 
+#[derive(Debug, Clone, Default)]
+pub struct RefAttrs {
+    pub html_id: Option<String>,
+    pub class_name: Option<String>,
+    pub title: Option<String>,
+    pub aria_label: Option<String>,
+    pub input_type: Option<String>,
+    pub autocomplete: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RefEntry {
     pub backend_node_id: Option<i64>,
@@ -13,6 +23,7 @@ pub struct RefEntry {
     pub nth: Option<usize>,
     pub selector: Option<String>,
     pub frame_id: Option<String>,
+    pub attrs: RefAttrs,
 }
 
 pub struct RefMap {
@@ -57,6 +68,7 @@ impl RefMap {
                 nth,
                 selector: None,
                 frame_id: frame_id.map(|s| s.to_string()),
+                attrs: RefAttrs::default(),
             },
         );
     }
@@ -78,8 +90,18 @@ impl RefMap {
                 nth,
                 selector: Some(selector),
                 frame_id: None,
+                attrs: RefAttrs::default(),
             },
         );
+    }
+
+    /// Patch the attribute bundle for an existing ref. Used by the snapshot
+    /// pipeline to fold per-element DOM attrs (`id`, `class`, `title`,
+    /// `aria-label`, `type`, `autocomplete`) onto refs after the AX walk.
+    pub fn set_attrs(&mut self, ref_id: &str, attrs: RefAttrs) {
+        if let Some(entry) = self.map.get_mut(ref_id) {
+            entry.attrs = attrs;
+        }
     }
 
     pub fn get(&self, ref_id: &str) -> Option<&RefEntry> {

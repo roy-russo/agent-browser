@@ -2491,6 +2491,7 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             .and_then(|v| v.as_u64())
             .map(|d| d as usize),
         urls: cmd.get("urls").and_then(|v| v.as_bool()).unwrap_or(false),
+        attrs: cmd.get("attrs").and_then(|v| v.as_bool()).unwrap_or(false),
     };
 
     state.ref_map.clear();
@@ -2514,6 +2515,28 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             let mut obj = serde_json::Map::new();
             obj.insert("role".into(), Value::String(entry.role));
             obj.insert("name".into(), Value::String(entry.name));
+            // Optional DOM attrs from --attrs. Absent fields stay absent in
+            // the output so the legacy {role,name}-only shape is preserved
+            // when --attrs is off.
+            let a = &entry.attrs;
+            if let Some(ref v) = a.html_id {
+                obj.insert("id".into(), Value::String(v.clone()));
+            }
+            if let Some(ref v) = a.class_name {
+                obj.insert("class".into(), Value::String(v.clone()));
+            }
+            if let Some(ref v) = a.title {
+                obj.insert("title".into(), Value::String(v.clone()));
+            }
+            if let Some(ref v) = a.aria_label {
+                obj.insert("ariaLabel".into(), Value::String(v.clone()));
+            }
+            if let Some(ref v) = a.input_type {
+                obj.insert("type".into(), Value::String(v.clone()));
+            }
+            if let Some(ref v) = a.autocomplete {
+                obj.insert("autocomplete".into(), Value::String(v.clone()));
+            }
             (ref_id, Value::Object(obj))
         })
         .collect();
