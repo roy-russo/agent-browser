@@ -509,6 +509,11 @@ pub async fn take_snapshot(
             "spinbutton",
             "slider",
             "tab",
+            // Iframes carry vendor-identifying id/title/class on captcha
+            // challenge pages (DataDome's `id="sec-cpt-if"`, Cloudflare's
+            // `title="Just a moment..."`); enrichment lets consumers
+            // disambiguate vendor without third-party src matching.
+            "Iframe",
         ];
 
         let attr_nodes: Vec<(usize, i64)> = tree_nodes
