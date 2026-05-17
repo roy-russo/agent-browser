@@ -1413,6 +1413,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "pause" => handle_pause(state).await,
         "multiselect" => handle_multiselect(cmd, state).await,
         "responsebody" => handle_responsebody(cmd, state).await,
+        "fetchmetadata" => handle_fetch_metadata(cmd, state).await,
         "waitfordownload" => handle_waitfordownload(cmd, state).await,
         "window_new" => handle_window_new(cmd, state).await,
         "diff_screenshot" => handle_diff_screenshot(cmd, state).await,
@@ -6314,6 +6315,433 @@ async fn handle_responsebody(cmd: &Value, state: &DaemonState) -> Result<Value, 
             }
         }
     }
+}
+
+/// One-shot, atomic page-metadata fetch. Creates a fresh target, navigates
+/// to `url`, waits for `Network.responseReceived` on the main document,
+/// pulls the body via `Network.getResponseBody`, parses `<title>` from the
+/// raw HTML (no JS execution), and closes the target. Returns
+/// `{title, status, url, elapsed_ms}`.
+///
+/// Designed for classification pipelines that only need metadata and can
+/// tolerate empty title on SPAs / captcha pages (where title isn't in the
+/// initial HTML response).
+///
+/// Always closes the target on exit — even on error paths — to prevent
+/// orphan tabs from accumulating in a long-running chrome.
+///
+/// Concurrency: the work runs entirely against a cloned `Arc<CdpClient>`
+/// and a per-target CDP session, so independent fetches share no daemon
+/// state. The daemon dispatch site routes this action through
+/// `execute_fetch_metadata_concurrent`, which snapshots the client under
+/// a brief lock and runs the long event-loop wait with the global state
+/// mutex released — letting multiple workers drive concurrent fetches
+/// against one daemon (chrome multiplexes targets natively).
+async fn handle_fetch_metadata(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let timeout_ms = state.timeout_ms(cmd);
+    let client = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .client
+        .clone();
+    fetch_metadata_inner(cmd, client, timeout_ms).await
+}
+
+/// Lock-free dispatch entry for `fetch-metadata`.
+///
+/// `handle_fetch_metadata` reached through `execute_command` would inherit
+/// the caller's global `DaemonState` mutex for its entire (up-to-25 s)
+/// `Network.loadingFinished` wait — serializing every other daemon
+/// command, including independent concurrent fetch-metadatas. This path
+/// briefly locks state to check policy and snapshot the `Arc<CdpClient>` +
+/// configured timeout, drops the lock, then runs the actual work via
+/// `fetch_metadata_inner`. Result is wrapped in the standard
+/// `{id, success, data|error}` envelope so it slots into the daemon's
+/// response pipeline alongside `execute_command` output.
+pub async fn execute_fetch_metadata_concurrent(
+    cmd: &Value,
+    state: &Arc<tokio::sync::Mutex<DaemonState>>,
+) -> Value {
+    let id = cmd
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Brief lock: policy check, snapshot client + timeout. No event
+    // draining, no AX bundling, no stream broadcast — those are
+    // global-state concerns that don't apply to a one-shot fresh-target
+    // fetch (it owns its target and tears it down before returning).
+    let (client, timeout_ms) = {
+        let s = state.lock().await;
+        if let Some(ref policy) = s.policy {
+            match policy.check("fetchmetadata") {
+                PolicyResult::Allow => {}
+                PolicyResult::Deny(reason) => {
+                    return error_response(
+                        &id,
+                        &format!("Action 'fetchmetadata' denied by policy: {}", reason),
+                    );
+                }
+                PolicyResult::RequiresConfirmation => {
+                    // Confirmation tracking mutates DaemonState; bounce
+                    // back through the locked path so `pending_confirmation`
+                    // is recorded consistently with every other action.
+                    drop(s);
+                    let mut sw = state.lock().await;
+                    return execute_command(cmd, &mut sw).await;
+                }
+            }
+        }
+        let client = match s.browser.as_ref() {
+            Some(b) => b.client.clone(),
+            None => return error_response(&id, "Browser not launched"),
+        };
+        (client, s.timeout_ms(cmd))
+    };
+
+    match fetch_metadata_inner(cmd, client, timeout_ms).await {
+        Ok(data) => success_response(&id, data),
+        Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
+    }
+}
+
+/// Core fetch-metadata implementation. Operates entirely against the
+/// passed-in `Arc<CdpClient>` and a per-target CDP session — no shared
+/// daemon state — so concurrent calls against independent targets are
+/// safe to run without the global state mutex held.
+async fn fetch_metadata_inner(
+    cmd: &Value,
+    client: Arc<CdpClient>,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let url = cmd
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'url' parameter")?
+        .to_string();
+    let started = std::time::Instant::now();
+
+    // 1. Create a fresh target. We deliberately do NOT add it to
+    //    `mgr.pages` — this is a one-shot operation that owns its target
+    //    end-to-end and tears it down on every exit path. No tab-tracking
+    //    state leaks into the session.
+    let create: super::cdp::types::CreateTargetResult = client
+        .send_command_typed(
+            "Target.createTarget",
+            &super::cdp::types::CreateTargetParams {
+                url: "about:blank".to_string(),
+            },
+            None,
+        )
+        .await?;
+    let target_id = create.target_id;
+
+    // Inline closure — captures `target_id` and runs the real work.
+    // After it returns (success or error) we always close the target.
+    let inner_result = async {
+        let attach: super::cdp::types::AttachToTargetResult = client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &super::cdp::types::AttachToTargetParams {
+                    target_id: target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+        let session_id = attach.session_id;
+
+        // Enable the domains we need. Network.enable must come before
+        // Page.navigate so we don't miss the responseReceived event.
+        client
+            .send_command_no_params("Network.enable", Some(&session_id))
+            .await?;
+        client
+            .send_command_no_params("Page.enable", Some(&session_id))
+            .await?;
+
+        // Subscribe BEFORE navigate to avoid a race where the response
+        // arrives between Page.navigate dispatch and our subscription.
+        let mut rx = client.subscribe();
+
+        let _: super::cdp::types::PageNavigateResult = client
+            .send_command_typed(
+                "Page.navigate",
+                &super::cdp::types::PageNavigateParams {
+                    url: url.clone(),
+                    referrer: None,
+                },
+                Some(&session_id),
+            )
+            .await?;
+
+        // Walk events looking for:
+        //   1. `Network.responseReceived` with type=="Document" and a
+        //      non-redirect status (skip 3xx — the redirect chain's
+        //      bodies are empty or stub redirect text; we want the
+        //      final destination). Capture requestId, status, finalUrl.
+        //   2. `Network.loadingFinished` for that same requestId,
+        //      signalling the body has been fully received. Without this
+        //      wait, `Network.getResponseBody` races and errors with
+        //      "No data found for resource with given identifier".
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(timeout_ms);
+        let mut final_request_id: Option<String> = None;
+        let mut final_status: i64 = 0;
+        let mut final_url = String::new();
+        let mut loading_finished = false;
+        while !loading_finished {
+            let remaining =
+                deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err::<Value, String>(format!(
+                    "Timeout waiting for main-document response from {}",
+                    url
+                ));
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(event)) => {
+                    if event.session_id.as_deref() != Some(session_id.as_str()) {
+                        continue;
+                    }
+                    match event.method.as_str() {
+                        "Network.responseReceived" => {
+                            let typ = event
+                                .params
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if typ != "Document" {
+                                continue;
+                            }
+                            let response = event.params.get("response");
+                            let status = response
+                                .and_then(|r| r.get("status"))
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            // Skip redirect chain — the final response
+                            // (2xx/4xx/5xx with actual body) is what we want.
+                            if (300..400).contains(&status) {
+                                continue;
+                            }
+                            final_request_id = event
+                                .params
+                                .get("requestId")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            final_status = status;
+                            final_url = response
+                                .and_then(|r| r.get("url"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                        "Network.loadingFinished" => {
+                            let rid = event
+                                .params
+                                .get("requestId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if final_request_id.as_deref() == Some(rid) {
+                                loading_finished = true;
+                            }
+                        }
+                        "Network.loadingFailed" => {
+                            let rid = event
+                                .params
+                                .get("requestId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if final_request_id.as_deref() == Some(rid) {
+                                let err_text = event
+                                    .params
+                                    .get("errorText")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("loadingFailed");
+                                return Err(format!(
+                                    "Main document loading failed: {}",
+                                    err_text
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => return Err("Event stream closed".to_string()),
+                Err(_) => {
+                    return Err(format!(
+                        "Timeout waiting for main-document response from {}",
+                        url
+                    ));
+                }
+            }
+        }
+
+        let request_id = final_request_id
+            .ok_or("Internal: loading finished without a tracked requestId")?;
+        let status = final_status;
+
+        // Fetch the body. `Network.getResponseBody` returns the full body
+        // either as a plain string or base64-encoded (for binary responses
+        // — should be rare for the main HTML document).
+        let body_result = client
+            .send_command(
+                "Network.getResponseBody",
+                Some(json!({ "requestId": request_id })),
+                Some(&session_id),
+            )
+            .await?;
+        let body = body_result
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_base64 = body_result
+            .get("base64Encoded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let title = if is_base64 {
+            // Binary main response — we can't parse a title out of it.
+            String::new()
+        } else {
+            parse_title_from_html(body)
+        };
+
+        Ok(json!({
+            "title": title,
+            "status": status,
+            "url": final_url,
+        }))
+    }
+    .await;
+
+    // Always close the target, regardless of inner success/failure.
+    let _: Result<Value, String> = client
+        .send_command_typed::<_, Value>(
+            "Target.closeTarget",
+            &super::cdp::types::CloseTargetParams {
+                target_id: target_id.clone(),
+            },
+            None,
+        )
+        .await;
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let mut output = inner_result?;
+    if let Some(obj) = output.as_object_mut() {
+        obj.insert("elapsed_ms".to_string(), json!(elapsed_ms));
+    }
+    Ok(output)
+}
+
+/// Minimal `<title>...</title>` extractor — no JS execution, no full HTML
+/// parser. Case-insensitive open-tag match, tolerant of attributes on the
+/// tag (rare but legal). Decodes a small set of common HTML entities so
+/// curl-equivalent output looks the same as what an actual browser would
+/// render. Returns an empty string when the document has no title element
+/// (SPAs, captcha interstitials, raw JSON responses, etc.).
+fn parse_title_from_html(html: &str) -> String {
+    // Case-insensitive search for `<title` (followed by `>` or space).
+    let lower = html.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    let raw = loop {
+        let Some(rel) = lower[search_from..].find("<title") else {
+            return String::new();
+        };
+        let open_start = search_from + rel;
+        let after_tag = open_start + "<title".len();
+        // Next char must be `>` or whitespace, otherwise this is some
+        // other tag like `<titlebar>`.
+        let next_byte = lower.as_bytes().get(after_tag).copied();
+        let valid = matches!(next_byte, Some(b'>') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r'));
+        if !valid {
+            search_from = after_tag;
+            continue;
+        }
+        // Find the closing `>` of the opening tag.
+        let Some(gt_rel) = lower[after_tag..].find('>') else {
+            return String::new();
+        };
+        let content_start = after_tag + gt_rel + 1;
+        // Find `</title>` (or end of doc).
+        let Some(close_rel) = lower[content_start..].find("</title") else {
+            return String::new();
+        };
+        let content_end = content_start + close_rel;
+        break html[content_start..content_end].trim().to_string();
+    };
+
+    decode_entities(&raw)
+}
+
+fn decode_entities(s: &str) -> String {
+    // Cover the entities most often seen in real-world `<title>` content.
+    // A full entity table would pull in a crate; this hits the >99% case
+    // for English-and-Latin-script titles and the common smart-quote /
+    // dash / nbsp set. Bytes that don't decode pass through verbatim.
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if let Some(semi_rel) = s[i..].find(';') {
+                let entity = &s[i + 1..i + semi_rel];
+                let replaced: Option<&'static str> = match entity {
+                    "amp" => Some("&"),
+                    "lt" => Some("<"),
+                    "gt" => Some(">"),
+                    "quot" => Some("\""),
+                    "apos" => Some("'"),
+                    "nbsp" => Some(" "),
+                    "ndash" => Some("\u{2013}"),
+                    "mdash" => Some("\u{2014}"),
+                    "lsquo" => Some("\u{2018}"),
+                    "rsquo" => Some("\u{2019}"),
+                    "ldquo" => Some("\u{201C}"),
+                    "rdquo" => Some("\u{201D}"),
+                    "hellip" => Some("\u{2026}"),
+                    "trade" => Some("\u{2122}"),
+                    "copy" => Some("\u{00A9}"),
+                    "reg" => Some("\u{00AE}"),
+                    _ => None,
+                };
+                if let Some(s2) = replaced {
+                    out.push_str(s2);
+                    i += semi_rel + 1;
+                    continue;
+                }
+                // Numeric entity: &#NNN; or &#xHH;
+                if entity.starts_with('#') {
+                    let payload = &entity[1..];
+                    let codepoint = if let Some(hex) = payload
+                        .strip_prefix('x')
+                        .or_else(|| payload.strip_prefix('X'))
+                    {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        payload.parse::<u32>().ok()
+                    };
+                    if let Some(c) = codepoint.and_then(char::from_u32) {
+                        out.push(c);
+                        i += semi_rel + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Copy current char (handles multi-byte UTF-8 correctly).
+        let ch_start = i;
+        let mut ch_end = i + 1;
+        while ch_end < bytes.len() && (bytes[ch_end] & 0b1100_0000) == 0b1000_0000 {
+            ch_end += 1;
+        }
+        out.push_str(&s[ch_start..ch_end]);
+        i = ch_end;
+    }
+    out
 }
 
 async fn handle_waitfordownload(cmd: &Value, state: &DaemonState) -> Result<Value, String> {

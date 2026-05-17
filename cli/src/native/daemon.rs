@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::signal;
 use tokio::sync::{mpsc, Notify, RwLock};
 
-use super::actions::{execute_command, DaemonState};
+use super::actions::{execute_command, execute_fetch_metadata_concurrent, DaemonState};
 use super::cdp::client::CdpClient;
 use super::state;
 use super::stream::StreamServer;
@@ -399,9 +399,18 @@ async fn handle_connection<S>(
                     let _ = tx.try_send(());
                 }
 
-                let is_close = cmd.get("action").and_then(|v| v.as_str()) == Some("close");
+                let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let is_close = action == "close";
 
-                let response = {
+                // `fetchmetadata` runs a multi-second CDP event-loop wait.
+                // Holding the global state mutex across that wait would
+                // serialize every other command — including independent
+                // fetchmetadata calls on their own targets, which share
+                // no state. Route it through the concurrent path so the
+                // mutex stays free.
+                let response = if action == "fetchmetadata" {
+                    execute_fetch_metadata_concurrent(&cmd, &state).await
+                } else {
                     let mut s = state.lock().await;
                     execute_command(&cmd, &mut s).await
                 };
