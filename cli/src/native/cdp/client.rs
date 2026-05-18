@@ -18,6 +18,11 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
 const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
+/// Floor for the per-CDP-command response deadline used by `send_command`
+/// when `AGENT_BROWSER_DEFAULT_TIMEOUT` is unset or unparseable. Matches the
+/// historical hardcoded value so unconfigured callers keep their old budget.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 /// Raw incoming CDP message (text) broadcast to all subscribers.
 /// Used by the inspect proxy to forward responses and events to DevTools.
 #[derive(Debug, Clone)]
@@ -41,6 +46,16 @@ pub struct CdpClient {
     pending: PendingMap,
     event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
+    /// Per-request response deadline used by `send_command`. Sourced from
+    /// `AGENT_BROWSER_DEFAULT_TIMEOUT` at connect time so callers like the
+    /// daemon can shrink the worst-case wait when Chrome stops talking back
+    /// mid-command (e.g. a hung `Page.navigate` on an unresponsive site).
+    /// Before this was configurable, every CDP call had a hardcoded 30 s
+    /// floor that no upstream timer (Swift wall-clock, supervisor lease,
+    /// `AGENT_BROWSER_DEFAULT_TIMEOUT` itself) could shrink — they all sat
+    /// above this one in the stack, so the visible kill age was pinned to
+    /// curl_prefix + 30 s + teardown regardless of what was configured.
+    default_request_timeout: std::time::Duration,
     _reader_handle: tokio::task::JoinHandle<()>,
     _keepalive_handle: tokio::task::JoinHandle<()>,
 }
@@ -166,7 +181,7 @@ impl CdpClient {
 
             // Reader loop exited (connection closed or error). Drop all pending
             // command senders so callers get an immediate channel-closed error
-            // instead of waiting for the 30-second timeout.
+            // instead of waiting for the per-request timeout.
             pending_clone.lock().await.clear();
 
             // Stop the keepalive task — the connection is gone.
@@ -192,12 +207,19 @@ impl CdpClient {
             }
         });
 
+        let default_request_timeout = std::env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS));
+
         Ok(Self {
             ws_tx,
             next_id: AtomicU64::new(1),
             pending,
             event_tx,
             raw_tx,
+            default_request_timeout,
             _reader_handle: reader_handle,
             _keepalive_handle: keepalive_handle,
         })
@@ -236,7 +258,7 @@ impl CdpClient {
                 .map_err(|e| format!("Failed to send CDP command: {}", e))?;
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        let response = match tokio::time::timeout(self.default_request_timeout, rx).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => return Err("CDP response channel closed".to_string()),
             Err(_) => {
