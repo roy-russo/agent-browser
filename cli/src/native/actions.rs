@@ -6645,16 +6645,24 @@ async fn fetch_metadata_inner(
     }
     .await;
 
-    // Always close the target, regardless of inner success/failure.
-    let _: Result<Value, String> = client
-        .send_command_typed::<_, Value>(
-            "Target.closeTarget",
-            &super::cdp::types::CloseTargetParams {
-                target_id: target_id.clone(),
-            },
-            None,
-        )
-        .await;
+    // Best-effort target close. We *want* Chrome to reap the orphan tab,
+    // but we don't want this cleanup to compound on top of an outer
+    // event-loop timeout: on a hung site the inner `inner_result` already
+    // burned the configured budget waiting for `Network.loadingFinished`,
+    // and the CDP send_command floor (`default_request_timeout`) would
+    // then re-spend that same budget here waiting for closeTarget to ack.
+    // For a known-stuck navigation Chrome routinely takes >5 s to respond
+    // to closeTarget, so we'd double the visible kill age and force the
+    // Swift-side wall-clock SIGTERM to fire. Cap this at 1 s and move on
+    // — Chrome cleans the orphan when our CDP session disconnects anyway.
+    let close_fut = client.send_command_typed::<_, Value>(
+        "Target.closeTarget",
+        &super::cdp::types::CloseTargetParams {
+            target_id: target_id.clone(),
+        },
+        None,
+    );
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), close_fut).await;
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let mut output = inner_result?;
