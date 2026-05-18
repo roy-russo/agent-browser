@@ -6603,11 +6603,38 @@ async fn fetch_metadata_inner(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let title = if is_base64 {
+        let raw_html_title = if is_base64 {
             // Binary main response — we can't parse a title out of it.
             String::new()
         } else {
             parse_title_from_html(body)
+        };
+
+        // Debug dump: write the body Chrome handed us to disk for
+        // post-mortem inspection (compare against what `document.title`
+        // ends up as after JS runs). One file per host, overwritten on
+        // every call.
+        dump_fetch_metadata_debug(&url, &final_url, status, is_base64, &raw_html_title, body);
+
+        // SPA / JS-set title fallback. If the initial HTML had no <title>
+        // (or an empty one) and the response itself is OK, the page is
+        // most likely an SPA that sets `document.title` from JavaScript
+        // after hydration. Poll for it briefly before closing the target
+        // instead of returning empty. Server-rendered pages skip this
+        // entirely — they already have their title from the raw HTML, so
+        // the fast path is unchanged.
+        let title = if raw_html_title.is_empty()
+            && !is_base64
+            && (200..400).contains(&status)
+        {
+            poll_document_title(
+                client.as_ref(),
+                &session_id,
+                std::time::Duration::from_millis(3000),
+            )
+            .await
+        } else {
+            raw_html_title
         };
 
         Ok(json!({
@@ -6635,6 +6662,112 @@ async fn fetch_metadata_inner(
         obj.insert("elapsed_ms".to_string(), json!(elapsed_ms));
     }
     Ok(output)
+}
+
+/// Poll `document.title` via `Runtime.evaluate` until non-empty or the
+/// deadline elapses. Returns whatever the last evaluation produced
+/// (empty string if the deadline hit before a title appeared).
+///
+/// Used by `fetch_metadata_inner` to recover SPA titles when the raw
+/// HTML response had no `<title>` element — typical for x.com / twitter
+/// / react-app shells where the title is set by JS after hydration.
+/// Server-rendered pages never reach this path (their raw-HTML title is
+/// already populated), so the fast path is unchanged.
+async fn poll_document_title(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    timeout: std::time::Duration,
+) -> String {
+    let deadline = std::time::Instant::now() + timeout;
+    let tick = std::time::Duration::from_millis(200);
+    let mut last_title = String::new();
+    while std::time::Instant::now() < deadline {
+        let result: Result<super::cdp::types::EvaluateResult, String> = client
+            .send_command_typed(
+                "Runtime.evaluate",
+                &super::cdp::types::EvaluateParams {
+                    expression: "document.title".to_string(),
+                    return_by_value: Some(true),
+                    await_promise: Some(false),
+                },
+                Some(session_id),
+            )
+            .await;
+        if let Ok(r) = result {
+            if let Some(v) = r.result.value.as_ref().and_then(|v| v.as_str()) {
+                let t = v.trim().to_string();
+                if !t.is_empty() {
+                    return t;
+                }
+                last_title = t;
+            }
+        }
+        tokio::time::sleep(tick).await;
+    }
+    last_title
+}
+
+/// Diagnostic body dump for `fetch-metadata`. Writes the raw HTTP
+/// response body Chrome handed us to `/tmp/ab-fetch-metadata-<host>.html`
+/// so we can post-mortem what `parse_title_from_html` saw versus what
+/// `document.title` becomes after JS. One file per host (overwritten on
+/// each call); errors are swallowed — diagnostics must never affect the
+/// fetch path.
+///
+/// Gated on `AGENT_BROWSER_FETCH_METADATA_DEBUG` env var (any non-empty
+/// value enables it). Off by default so production callers don't litter
+/// `/tmp` — useful flag for goodboy vault-classifier debugging sessions
+/// where we want to inspect what Chrome handed AB on specific
+/// per-root failures.
+fn dump_fetch_metadata_debug(
+    requested_url: &str,
+    final_url: &str,
+    status: i64,
+    is_base64: bool,
+    raw_html_title: &str,
+    body: &str,
+) {
+    if std::env::var("AGENT_BROWSER_FETCH_METADATA_DEBUG")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    use std::io::Write;
+    let host = host_for_url(final_url)
+        .or_else(|| host_for_url(requested_url))
+        .unwrap_or_else(|| "unknown".to_string());
+    let safe_host: String = host
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    let path = format!("/tmp/ab-fetch-metadata-{}.html", safe_host);
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = writeln!(f, "<!-- requested_url: {} -->", requested_url);
+        let _ = writeln!(f, "<!-- final_url: {} -->", final_url);
+        let _ = writeln!(f, "<!-- status: {} -->", status);
+        let _ = writeln!(f, "<!-- is_base64: {} -->", is_base64);
+        let _ = writeln!(f, "<!-- raw_html_title: {:?} -->", raw_html_title);
+        let _ = writeln!(f, "<!-- body_bytes: {} -->", body.len());
+        let _ = f.write_all(body.as_bytes());
+    }
+    eprintln!(
+        "[fetch-metadata] {} status={} raw_html_title={:?} body_bytes={} -> {}",
+        final_url, status, raw_html_title, body.len(), path
+    );
+}
+
+/// Extract host substring from a URL without pulling in the `url` crate.
+/// Returns `None` if the input doesn't look like an absolute URL with a
+/// recognisable host.
+fn host_for_url(s: &str) -> Option<String> {
+    let after_scheme = s.split_once("://")?.1;
+    let host = after_scheme
+        .split(|c: char| c == '/' || c == '?' || c == '#')
+        .next()?;
+    let host = host.split('@').next_back()?;
+    let host = host.split(':').next()?;
+    if host.is_empty() { None } else { Some(host.to_string()) }
 }
 
 /// Minimal `<title>...</title>` extractor — no JS execution, no full HTML
