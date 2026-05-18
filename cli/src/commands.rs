@@ -265,9 +265,46 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             // scripts before the first real navigation (see `batch`).
             // `goto` and `navigate` still require a URL since those verbs
             // imply the navigation itself.
-            let first_url = rest.iter().find(|a| !a.starts_with("--"));
+            //
+            // `--wait-until <load|domcontentloaded|networkidle|none>` lets
+            // callers bail before the full asset cascade. Useful when the
+            // caller only needs document metadata (title, OG tags) — DCL
+            // fires once HTML is parsed, well before images/CSS/fonts
+            // finish loading. Default stays `load` for backwards-compat.
+            let mut wait_until: Option<&str> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                if rest[i] == "--wait-until" {
+                    if let Some(val) = rest.get(i + 1) {
+                        wait_until = Some(*val);
+                        i += 2;
+                        continue;
+                    }
+                    return Err(ParseError::MissingArguments {
+                        context: format!("{} --wait-until", cmd),
+                        usage: "open <url> --wait-until <load|domcontentloaded|networkidle|none>",
+                    });
+                }
+                i += 1;
+            }
+            let mut first_url: Option<&str> = None;
+            let mut skip_next = false;
+            for arg in &rest {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if *arg == "--wait-until" {
+                    skip_next = true;
+                    continue;
+                }
+                if !arg.starts_with("--") {
+                    first_url = Some(*arg);
+                    break;
+                }
+            }
             let url = match first_url {
-                Some(u) => *u,
+                Some(u) => u,
                 None if cmd == "open" => {
                     return Ok(json!({ "id": id, "action": "launch", "headless": !flags.headed }));
                 }
@@ -295,6 +332,9 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             if flags.provider.is_some() {
                 nav_cmd["waitUntil"] = json!("none");
             }
+            if let Some(w) = wait_until {
+                nav_cmd["waitUntil"] = json!(w);
+            }
             if let Some(ref headers_json) = flags.headers {
                 let headers =
                     serde_json::from_str::<serde_json::Value>(headers_json).map_err(|_| {
@@ -316,6 +356,29 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         "back" => Ok(json!({ "id": id, "action": "back" })),
         "forward" => Ok(json!({ "id": id, "action": "forward" })),
         "reload" => Ok(json!({ "id": id, "action": "reload" })),
+
+        // One-shot, atomic page-metadata fetch. The daemon creates a fresh
+        // target, navigates to <url>, waits for `Network.responseReceived`
+        // on the main document, pulls the response body via
+        // `Network.getResponseBody`, parses the `<title>` server-side, and
+        // closes the target. Returns `{title, status, url, elapsed_ms}`.
+        // Designed for classification pipelines that need page metadata
+        // without paying for full DCL / asset cascade / JS rendering.
+        "fetch-metadata" | "fetchmetadata" => {
+            let url = rest.first().ok_or_else(|| ParseError::MissingArguments {
+                context: "fetch-metadata".to_string(),
+                usage: "fetch-metadata <url>",
+            })?;
+            let url_lower = url.to_lowercase();
+            let url = if url_lower.starts_with("http://")
+                || url_lower.starts_with("https://")
+            {
+                url.to_string()
+            } else {
+                format!("https://{}", url)
+            };
+            Ok(json!({ "id": id, "action": "fetchmetadata", "url": url }))
+        }
 
         // === Core Actions ===
         "click" => {
