@@ -6655,11 +6655,15 @@ async fn fetch_metadata_inner(
     // to closeTarget, so we'd double the visible kill age and force the
     // Swift-side wall-clock SIGTERM to fire. Cap this at 1 s and move on
     // — Chrome cleans the orphan when our CDP session disconnects anyway.
+    // Bind the params so the `&` borrow outlives the awaited future — an
+    // inline `&CloseTargetParams { … }` temporary is freed at the end of the
+    // statement, before the `.await` below still needs it (E0716).
+    let close_params = super::cdp::types::CloseTargetParams {
+        target_id: target_id.clone(),
+    };
     let close_fut = client.send_command_typed::<_, Value>(
         "Target.closeTarget",
-        &super::cdp::types::CloseTargetParams {
-            target_id: target_id.clone(),
-        },
+        &close_params,
         None,
     );
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), close_fut).await;
