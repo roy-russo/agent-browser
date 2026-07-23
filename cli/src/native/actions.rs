@@ -260,6 +260,15 @@ pub struct DaemonState {
     /// Last viewport settings (width, height, deviceScaleFactor, mobile),
     /// re-applied to new contexts (e.g., recording).
     pub viewport: Option<(i32, i32, f64, bool)>,
+    /// True once this session has been bound to an *externally owned* browser
+    /// (`connect <port|url>`, or auto-connect). Sticky for the session's life.
+    ///
+    /// `BrowserManager::is_cdp_connection()` already answers "is the browser I
+    /// hold right now an attachment?" — but that answer dies with the handle,
+    /// and the handle is dropped precisely when the connection goes stale. The
+    /// caller's *intent* to drive someone else's browser has to outlive the
+    /// handle, or the recovery path silently substitutes a browser of our own.
+    pub external_attach: bool,
 }
 
 impl DaemonState {
@@ -314,6 +323,8 @@ impl DaemonState {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30_000),
             viewport: None,
+            external_attach: env::var("AGENT_BROWSER_CDP").is_ok()
+                || env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok(),
         }
     }
 
@@ -1247,6 +1258,24 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         };
 
         if needs_launch {
+            // Refuse to invent a browser for a session that asked to drive
+            // someone else's. Auto-launch is a convenience for "no browser
+            // yet"; applied after an attachment drops it is a substitution —
+            // the command still succeeds, against a *different* browser than
+            // the caller believes it is driving. That browser is headless by
+            // default and carries a blank temp profile, so it is both the
+            // wrong target and one many sites treat as a bot: every
+            // observation made through it is silently unreliable.
+            if state.external_attach {
+                return error_response(
+                    &id,
+                    "CDP target not reachable. This session asked to drive an external browser, \
+                     so it will not auto-launch one in its place — that would silently drive a \
+                     different browser (headless, blank profile) than the one you attached to. \
+                     Re-attach with `connect <port|url>`, or run `close` to release the \
+                     attachment and let this session start its own browser.",
+                );
+            }
             if state.browser.is_some() {
                 if let Some(ref mut mgr) = state.browser {
                     let _ = mgr.close().await;
@@ -1565,6 +1594,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
         let mgr = BrowserManager::connect_cdp(&cdp).await?;
         state.reset_input_state();
         state.browser = Some(mgr);
+        state.external_attach = true;
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -1578,6 +1608,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
     if env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok() {
         state.reset_input_state();
         state.browser = Some(connect_auto_with_fresh_tab().await?);
+        state.external_attach = true;
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -1951,6 +1982,15 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.ref_map.clear();
 
     let has_cdp = cdp_url.is_some() || cdp_port.is_some();
+
+    // Mark the intent *before* attempting the attach, not after it succeeds.
+    // A caller that asked for someone else's browser and didn't get it must
+    // not have one quietly built for it by the next command — which is exactly
+    // what happened when a recipe ignored a failed `connect` and carried on.
+    if has_cdp || auto_connect {
+        state.external_attach = true;
+    }
+
     super::browser::validate_launch_options(
         launch_options.extensions.as_deref(),
         has_cdp,
@@ -1963,37 +2003,43 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if let Some(url) = cdp_url {
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(url).await?);
+        state.external_attach = true;
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
         apply_launch_init_scripts(state).await;
-        return Ok(json!({ "launched": true }));
+        // `attached` distinguishes "bound to your browser" from "spawned one of
+        // mine". `launched` alone cannot: it is true for both, which is what
+        // made a substituted browser indistinguishable from a successful attach.
+        return Ok(json!({ "launched": true, "attached": true }));
     }
 
     if let Some(port) = cdp_port {
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
+        state.external_attach = true;
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
         apply_launch_init_scripts(state).await;
-        return Ok(json!({ "launched": true }));
+        return Ok(json!({ "launched": true, "attached": true }));
     }
 
     if auto_connect {
         state.reset_input_state();
         state.browser = Some(connect_auto_with_fresh_tab().await?);
+        state.external_attach = true;
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
         apply_launch_init_scripts(state).await;
-        return Ok(json!({ "launched": true }));
+        return Ok(json!({ "launched": true, "attached": true }));
     }
 
     if let Some(provider) = cmd.get("provider").and_then(|v| v.as_str()) {
@@ -2084,6 +2130,10 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     write_extensions_file(&state.session_id);
     state.reset_input_state();
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
+    // An explicit `launch` is the deliberate opt-in to a browser of our own —
+    // it clears any prior attachment intent, so a session can go back to a
+    // local browser on purpose rather than by accident.
+    state.external_attach = false;
     state.launch_hash = Some(new_hash);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
@@ -2410,6 +2460,9 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 }
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
+    // Closing releases the attachment intent as well as the browser: `close`
+    // is the deliberate way back to a session that may launch its own.
+    state.external_attach = false;
     if let Some(ref mgr) = state.browser {
         if let Some(ref session_name) = state.session_name {
             if let Ok(session_id) = mgr.active_session_id() {
@@ -9039,6 +9092,39 @@ mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
     use std::fs;
+
+    // `external_attach` is what stops a dropped attachment being silently
+    // replaced by a browser of our own (headless, blank profile — wrong target
+    // *and* widely bot-flagged). One EnvGuard per test: it holds a global
+    // mutex, so a second guard in the same test would deadlock.
+    const ATTACH_ENV: [&str; 2] = ["AGENT_BROWSER_CDP", "AGENT_BROWSER_AUTO_CONNECT"];
+
+    // A plain session owns its browser, so auto-launch may spawn one.
+    #[test]
+    fn external_attach_defaults_false() {
+        let g = EnvGuard::new(&ATTACH_ENV);
+        g.remove("AGENT_BROWSER_CDP");
+        g.remove("AGENT_BROWSER_AUTO_CONNECT");
+        assert!(!DaemonState::new().external_attach);
+    }
+
+    // Env-configured attachment must be remembered from the very first command,
+    // before any explicit `connect` reaches the daemon.
+    #[test]
+    fn external_attach_set_by_cdp_env() {
+        let g = EnvGuard::new(&ATTACH_ENV);
+        g.remove("AGENT_BROWSER_AUTO_CONNECT");
+        g.set("AGENT_BROWSER_CDP", "9222");
+        assert!(DaemonState::new().external_attach);
+    }
+
+    #[test]
+    fn external_attach_set_by_auto_connect_env() {
+        let g = EnvGuard::new(&ATTACH_ENV);
+        g.remove("AGENT_BROWSER_CDP");
+        g.set("AGENT_BROWSER_AUTO_CONNECT", "1");
+        assert!(DaemonState::new().external_attach);
+    }
 
     fn unique_socket_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
