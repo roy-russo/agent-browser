@@ -549,24 +549,96 @@ pub async fn take_snapshot(
                 futures_util::future::join_all(resolve_futs).await;
 
             // Phase 2: fetch attributes per object in parallel. Returns one
-            // JSON object per element with all six attrs (nullable).
+            // JSON object per element with the attrs (nullable), plus
+            // geometry and an occlusion verdict.
             // `className` is a string for HTMLElements but an SVGAnimatedString
             // for SVG, hence the typeof guard. Empty strings collapse to null
             // so the consumer sees absence as null, not "".
+            //
+            // Geometry + occlusion (added for Goodboy, 2026-07-26). The rect
+            // makes structural questions answerable without keywords — "is
+            // this in the header", "is this control inside the dialog that is
+            // open", "which corner holds the close button". The occlusion
+            // verdict comes from `elementFromPoint` at the element's own
+            // centre: if what is painted there is neither this element nor
+            // part of it, something covers it, and the covering node is
+            // described in `oc`. That turns overlay detection into geometry
+            // instead of a guess at what an overlay calls itself in its own
+            // markup.
+            //
+            // Both are frame-local: rects and hit-tests inside an iframe use
+            // that frame's coordinate space, so `tf` (top frame) travels with
+            // them and a consumer must not compare across frames without it.
             const ATTR_FN: &str = r#"function() {
                 var t = (this.tagName || '').toUpperCase();
                 var isInput = t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT';
                 var cn = null;
                 if (typeof this.className === 'string' && this.className) cn = this.className;
                 var ga = this.getAttribute ? this.getAttribute.bind(this) : function(){ return null; };
-                return {
+                var desc = function(el) {
+                    if (!el) return null;
+                    var s = (el.tagName || '?').toLowerCase();
+                    if (el.id) s += '#' + el.id;
+                    var c = (typeof el.className === 'string')
+                        ? el.className.trim().split(/\s+/).filter(Boolean).slice(0, 2).join('.')
+                        : '';
+                    if (c) s += '.' + c;
+                    return s.slice(0, 120);
+                };
+                var out = {
                     id: this.id || null,
                     cn: cn,
                     title: this.title || null,
                     al: ga('aria-label') || null,
                     ty: isInput ? (this.type || null) : null,
-                    ac: ga('autocomplete') || null
+                    ac: ga('autocomplete') || null,
+                    hr: null, r: null, occ: false, oc: null, ocr: null,
+                    off: false, hid: false, tf: true
                 };
+                // Anchors expose an absolute .href; SVG anchors expose an
+                // SVGAnimatedString, which the typeof guard drops.
+                if (typeof this.href === 'string' && this.href) out.hr = this.href;
+
+                var doc = this.ownerDocument;
+                var win = doc ? doc.defaultView : null;
+                if (!win) return out;
+                try { out.tf = (win === win.top); } catch (e) { out.tf = false; }
+
+                var rc = this.getBoundingClientRect ? this.getBoundingClientRect() : null;
+                if (!rc) return out;
+                out.r = [Math.round(rc.left), Math.round(rc.top),
+                         Math.round(rc.width), Math.round(rc.height)];
+                if (rc.width <= 0 || rc.height <= 0) out.hid = true;
+                try {
+                    var st = win.getComputedStyle(this);
+                    if (st && (st.visibility === 'hidden' || st.display === 'none'
+                               || parseFloat(st.opacity) === 0)) out.hid = true;
+                } catch (e) {}
+                if (out.hid) return out;
+
+                var cx = rc.left + rc.width / 2, cy = rc.top + rc.height / 2;
+                if (cx < 0 || cy < 0 || cx > win.innerWidth || cy > win.innerHeight) {
+                    out.off = true;
+                    return out;
+                }
+                var hit = doc.elementFromPoint(cx, cy);
+                if (!hit) { out.off = true; return out; }
+                // A descendant (the <span> inside a button) or an ancestor
+                // (a <label> wrapping an input) both count as not covered.
+                if (hit !== this && !this.contains(hit) && !hit.contains(this)) {
+                    out.occ = true;
+                    out.oc = desc(hit);
+                    // The occluder's own rect, so a caller can scope "which
+                    // controls belong to the thing in the way" by geometry.
+                    // Needed for a partial overlay (a bottom consent bar),
+                    // where the un-occluded set is most of the page.
+                    try {
+                        var hrc = hit.getBoundingClientRect();
+                        out.ocr = [Math.round(hrc.left), Math.round(hrc.top),
+                                   Math.round(hrc.width), Math.round(hrc.height)];
+                    } catch (e) {}
+                }
+                return out;
             }"#;
 
             let attr_futs: Vec<_> = resolved
@@ -605,6 +677,26 @@ pub async fn take_snapshot(
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string())
                 };
+                // Booleans are carried only when true, and `top_frame` only
+                // when false, so the refs dict stays as small as it was for
+                // the common case (visible element, top document).
+                let flag = |key: &str| -> Option<bool> {
+                    match v.get(key).and_then(|x| x.as_bool()) {
+                        Some(true) => Some(true),
+                        _ => None,
+                    }
+                };
+                let rect_at = |key: &str| -> Option<[i64; 4]> {
+                    let a = v.get(key)?.as_array()?;
+                    if a.len() != 4 {
+                        return None;
+                    }
+                    let mut out = [0i64; 4];
+                    for (i, n) in a.iter().enumerate() {
+                        out[i] = n.as_f64()? as i64;
+                    }
+                    Some(out)
+                };
                 let attrs = RefAttrs {
                     html_id: pick("id"),
                     class_name: pick("cn"),
@@ -612,6 +704,17 @@ pub async fn take_snapshot(
                     aria_label: pick("al"),
                     input_type: pick("ty"),
                     autocomplete: pick("ac"),
+                    href: pick("hr"),
+                    rect: rect_at("r"),
+                    occluded: flag("occ"),
+                    occluder: pick("oc"),
+                    occluder_rect: rect_at("ocr"),
+                    offscreen: flag("off"),
+                    hidden: flag("hid"),
+                    top_frame: match v.get("tf").and_then(|x| x.as_bool()) {
+                        Some(false) => Some(false),
+                        _ => None,
+                    },
                 };
                 if let Some(ref ref_id) = tree_nodes[idx].ref_id {
                     ref_map.set_attrs(ref_id, attrs);

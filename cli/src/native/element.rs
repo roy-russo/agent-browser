@@ -13,6 +13,39 @@ pub struct RefAttrs {
     pub aria_label: Option<String>,
     pub input_type: Option<String>,
     pub autocomplete: Option<String>,
+    /// Resolved absolute URL for anchors. Without it a consumer has to join
+    /// the snapshot markdown's link list back to this dict by visible text —
+    /// a join that breaks on padded or glyph-only names.
+    pub href: Option<String>,
+    /// `getBoundingClientRect` as `[x, y, w, h]`, rounded, **frame-local**
+    /// (see `top_frame`). Geometry is what lets a caller ask structural
+    /// questions — is this in the header, is this inside the open dialog,
+    /// which corner holds the close button — without keyword-matching.
+    pub rect: Option<[i64; 4]>,
+    /// True when something else paints over this element's own centre.
+    /// This is the occlusion signal: `elementFromPoint` at the centre
+    /// returned a node that is neither this element nor part of it.
+    pub occluded: Option<bool>,
+    /// Short descriptor (`tag#id.class`) of whatever is on top, set only
+    /// when `occluded`. Several refs naming the same occluder is how a
+    /// caller identifies an overlay it has no vendor keyword for.
+    pub occluder: Option<String>,
+    /// The occluder's own `[x, y, w, h]`. Lets a caller scope "which
+    /// controls belong to the thing in the way" geometrically — the
+    /// un-occluded refs whose centres fall inside this rect. Matters for
+    /// partial overlays (a bottom consent bar), where most of the page is
+    /// un-occluded and the un-occluded set alone says nothing.
+    pub occluder_rect: Option<[i64; 4]>,
+    /// Centre lies outside its frame's viewport — scrolled away rather than
+    /// covered. Kept distinct from `occluded`: the remedies differ.
+    pub offscreen: Option<bool>,
+    /// Zero-area or `display:none`-shaped. A caller filtering candidates
+    /// wants this gone before it counts what the page offers.
+    pub hidden: Option<bool>,
+    /// False when the element lives inside an iframe, meaning `rect` is in
+    /// that frame's coordinate space and is NOT comparable with rects from
+    /// the top document. Absent means top frame.
+    pub top_frame: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

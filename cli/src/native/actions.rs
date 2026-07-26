@@ -2591,11 +2591,71 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             if let Some(ref v) = a.autocomplete {
                 obj.insert("autocomplete".into(), Value::String(v.clone()));
             }
+            // Geometry + occlusion. `rect` is [x, y, w, h] in the element's
+            // own frame; `topFrame:false` marks the rects that are NOT in the
+            // top document's space. The remaining flags appear only when set,
+            // so an ordinary visible control serialises exactly as before.
+            if let Some(ref v) = a.href {
+                obj.insert("href".into(), Value::String(v.clone()));
+            }
+            if let Some(r) = a.rect {
+                obj.insert(
+                    "rect".into(),
+                    Value::Array(r.iter().map(|n| Value::from(*n)).collect()),
+                );
+            }
+            if a.occluded == Some(true) {
+                obj.insert("occluded".into(), Value::Bool(true));
+            }
+            if let Some(ref v) = a.occluder {
+                obj.insert("occluder".into(), Value::String(v.clone()));
+            }
+            if let Some(r) = a.occluder_rect {
+                obj.insert(
+                    "occluderRect".into(),
+                    Value::Array(r.iter().map(|n| Value::from(*n)).collect()),
+                );
+            }
+            if a.offscreen == Some(true) {
+                obj.insert("offscreen".into(), Value::Bool(true));
+            }
+            if a.hidden == Some(true) {
+                obj.insert("hidden".into(), Value::Bool(true));
+            }
+            if a.top_frame == Some(false) {
+                obj.insert("topFrame".into(), Value::Bool(false));
+            }
             (ref_id, Value::Object(obj))
         })
         .collect();
 
-    Ok(json!({ "snapshot": tree, "origin": url, "refs": refs }))
+    // Viewport of the top document, so a consumer can turn a ref's rect into
+    // a structural question — is this in the header band, does this occluder
+    // cover the whole page — without a second round-trip. Only meaningful
+    // alongside --attrs rects; omitted if it can't be read.
+    let viewport = if options.attrs {
+        mgr.client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": "[window.innerWidth, window.innerHeight, \
+                                   Math.round(window.scrollX), Math.round(window.scrollY)]",
+                    "returnByValue": true,
+                })),
+                Some(&session_id),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.get("result")?.get("value").cloned())
+    } else {
+        None
+    };
+
+    let mut out = json!({ "snapshot": tree, "origin": url, "refs": refs });
+    if let Some(v) = viewport {
+        out["viewport"] = v;
+    }
+    Ok(out)
 }
 
 async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
