@@ -340,6 +340,63 @@ mod imp {
         }
     }
 
+    /// Every pressable AXButton inside a popup, with the labels a caller could
+    /// match on and whether AXPress is actually offered.
+    ///
+    /// `items` above reports only AXStaticText, which is enough for the
+    /// autofill picker (its rows *are* static text) and useless for a bubble:
+    /// "Translate this page?" and "Restore pages?" carry their whole
+    /// interaction in buttons, and a caller reading only `items` sees a bubble
+    /// with no way out. It then has to *guess* button titles and press blind —
+    /// which is exactly how a walk ends up reporting "none of its 4 buttons
+    /// would press" while sitting under one.
+    ///
+    /// All four label attributes are reported separately rather than collapsed
+    /// into one string, because Chrome does not put the label in the same place
+    /// twice: a text button uses AXTitle, and the close "X" is a template image
+    /// whose only human-readable name is AXDescription.
+    fn collect_buttons(el: AXUIElementRef, depth: usize, idx: &mut i64, buttons: &mut Vec<Value>) {
+        if depth > MAX_LIST_DEPTH {
+            return;
+        }
+        let role = ax_str(el, kAXRoleAttribute);
+        if role == "AXButton" || role == "AXPopUpButton" || role == "AXRadioButton" {
+            let mut entry = Map::new();
+            entry.insert("index".into(), json!(*idx));
+            entry.insert("role".into(), Value::String(role));
+            for (key, attr) in [
+                ("title", kAXTitleAttribute),
+                ("desc", kAXDescriptionAttribute),
+                ("value", kAXValueAttribute),
+                ("help", kAXHelpAttribute),
+            ] {
+                let s = ax_str(el, attr);
+                if !s.is_empty() {
+                    entry.insert(key.into(), Value::String(s));
+                }
+            }
+            entry.insert(
+                "pressable".into(),
+                Value::Bool(ax_action_names(el).iter().any(|a| a == kAXPressAction)),
+            );
+            if let (Some(p), Some(s)) = (
+                ax_point(el, kAXPositionAttribute),
+                ax_size(el, kAXSizeAttribute),
+            ) {
+                entry.insert("x".into(), json!(p.x as i64));
+                entry.insert("y".into(), json!(p.y as i64));
+                entry.insert("w".into(), json!(s.width as i64));
+                entry.insert("h".into(), json!(s.height as i64));
+            }
+            buttons.push(Value::Object(entry));
+            *idx += 1;
+            return; // a button's children are its own label glyphs
+        }
+        for c in ax_children(el) {
+            collect_buttons(c.0, depth + 1, idx, buttons);
+        }
+    }
+
     fn find_popups(el: AXUIElementRef, depth: usize, results: &mut Vec<Map<String, Value>>) {
         if depth > MAX_WALK_DEPTH {
             return;
@@ -355,6 +412,12 @@ mod imp {
             collect_list_items(el, 0, &mut idx, &mut items);
             if !items.is_empty() {
                 entry.insert("items".into(), Value::Array(items));
+            }
+            let mut buttons: Vec<Value> = Vec::new();
+            let mut btn_idx: i64 = 0;
+            collect_buttons(el, 0, &mut btn_idx, &mut buttons);
+            if !buttons.is_empty() {
+                entry.insert("buttons".into(), Value::Array(buttons));
             }
             results.push(entry);
             return; // don't recurse into popup
@@ -632,6 +695,128 @@ mod imp {
         }
 
         Ok(report)
+    }
+
+    /// Collect the pressable controls under a popup, in the same order
+    /// `collect_buttons` reports them. The indices a caller reads out of
+    /// `popups[i].buttons[j]` are the indices it passes back here.
+    fn popup_button_elements(popup: AXUIElementRef) -> Vec<AxElement> {
+        let mut buttons: Vec<AxElement> = Vec::new();
+        fn walk(el: AXUIElementRef, depth: usize, buttons: &mut Vec<AxElement>) {
+            if depth > MAX_LIST_DEPTH {
+                return;
+            }
+            let role = ax_str(el, kAXRoleAttribute);
+            if role == "AXButton" || role == "AXPopUpButton" || role == "AXRadioButton" {
+                unsafe { CFRetain(el as CFTypeRef) };
+                buttons.push(AxElement(el));
+                return;
+            }
+            for c in ax_children(el) {
+                walk(c.0, depth + 1, buttons);
+            }
+        }
+        walk(popup, 0, &mut buttons);
+        buttons
+    }
+
+    /// Press `popups[popup_idx].buttons[button_idx]` — a specific button in a
+    /// specific bubble.
+    ///
+    /// `press_button_by_title` takes the first title match **anywhere in the
+    /// application**, which is unsafe the moment two bubbles are up at once:
+    /// on 2026-07-31 Chrome showed "Translate this page?" and "Restore pages?"
+    /// together, and *both* dismiss buttons are labelled "Close" — so a press
+    /// by title lands on whichever the tree walk reaches first, not the one the
+    /// caller reasoned about. Chrome's toolbar and tab strip carry their own
+    /// "Close" too.
+    ///
+    /// It also lets a caller press a control whose only human-readable name is
+    /// AXDescription, which is the normal case for a bubble's "X": Chrome ships
+    /// it as a template image with no AXTitle at all.
+    ///
+    /// `windows_before`/`windows_after` are the honest check, for the same
+    /// reason they are on the title form: AXPress reports success on a disabled
+    /// button, so only the bubble actually going away proves anything.
+    pub fn press_popup_button(
+        pid: i32,
+        popup_idx: usize,
+        button_idx: usize,
+        settle_ms: u64,
+    ) -> Result<Value, String> {
+        if !is_trusted() {
+            return Err(
+                "Accessibility permission required. Grant in System Settings → Privacy & \
+                 Security → Accessibility for this binary, then retry."
+                    .into(),
+            );
+        }
+
+        let app_raw = unsafe { AXUIElementCreateApplication(pid as accessibility_sys::pid_t) };
+        let app = unsafe { AxElement::from_create(app_raw) }
+            .ok_or_else(|| format!("AXUIElementCreateApplication returned null for pid {pid}"))?;
+
+        let windows_before = ax_element_array(app.0, kAXWindowsAttribute).len();
+
+        let popup = popup_ax_list_at_index(app.0, popup_idx)
+            .ok_or_else(|| format!("popup index {} not found", popup_idx))?;
+        let popup_title = ax_str(popup.0, kAXTitleAttribute);
+
+        let buttons = popup_button_elements(popup.0);
+        let button_count = buttons.len();
+        if button_idx >= button_count {
+            return Err(format!(
+                "button index {} out of range ({} buttons in popup \"{}\")",
+                button_idx, button_count, popup_title
+            ));
+        }
+        let mut iter = buttons.into_iter();
+        let button = iter.nth(button_idx).expect("bounds checked above");
+
+        let role = ax_str(button.0, kAXRoleAttribute);
+        let label = {
+            let t = ax_str(button.0, kAXTitleAttribute);
+            if t.is_empty() {
+                ax_str(button.0, kAXDescriptionAttribute)
+            } else {
+                t
+            }
+        };
+        let actions = ax_action_names(button.0);
+
+        if !actions.iter().any(|a| a == kAXPressAction) {
+            return Ok(json!({
+                "popup_title": popup_title,
+                "button_count": button_count,
+                "label": label,
+                "role": role,
+                "actions": actions,
+                "pressed": false,
+                "error": "AXPress action not exposed on the requested button",
+            }));
+        }
+
+        let action_cf = CFString::new(kAXPressAction);
+        let err = unsafe { AXUIElementPerformAction(button.0, action_cf.as_concrete_TypeRef()) };
+
+        if settle_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+        }
+        let windows_after = ax_element_array(app.0, kAXWindowsAttribute).len();
+
+        Ok(json!({
+            "popup_title": popup_title,
+            "button_count": button_count,
+            "label": label,
+            "role": role,
+            "actions": actions,
+            "pressed": err == 0,
+            "error_raw": err as i64,
+            "error_name": error_string(err),
+            "windows_before": windows_before,
+            "windows_after": windows_after,
+            "settled_ms": settle_ms,
+        }))
     }
 
     /// True if `attr` is currently settable on `el`. False on any error.
@@ -1031,7 +1216,7 @@ mod imp {
 #[cfg(target_os = "macos")]
 pub use imp::{
     detect_chrome_pid, enable_enhanced_user_interface, focused_snapshot, hid_click,
-    press_button_by_title, press_popup_item, set_focused_value,
+    press_button_by_title, press_popup_button, press_popup_item, set_focused_value,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -1073,4 +1258,14 @@ pub fn press_button_by_title(
     _settle_ms: u64,
 ) -> Result<serde_json::Value, String> {
     Err("AX press-button is only available on macOS".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn press_popup_button(
+    _pid: i32,
+    _popup_idx: usize,
+    _button_idx: usize,
+    _settle_ms: u64,
+) -> Result<serde_json::Value, String> {
+    Err("AX press-popup-button is only available on macOS".into())
 }

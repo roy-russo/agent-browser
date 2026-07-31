@@ -1984,6 +1984,66 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(payload)
         }
 
+        // ax-press-popup-button — press one specific button inside one specific
+        // popup, addressed by the indices `ax-snapshot` reports at
+        // popups[i].buttons[j]. Use this instead of ax-press-button whenever
+        // the target is a bubble: a title match scans the whole application and
+        // is ambiguous the moment two bubbles are up, and it cannot express
+        // "the X on THIS one" in a UI language you have not anticipated.
+        //
+        //   ax-press-popup-button <popup>:<button>
+        //   ax-press-popup-button --popup <N> --button <N> [--settle-ms <N>]
+        "ax-press-popup-button" | "ax_press_popup_button" => {
+            let mut popup: Option<i64> = None;
+            let mut button: Option<i64> = None;
+            let mut settle_ms: Option<i64> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--popup" => {
+                        i += 1;
+                        popup = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    "--button" => {
+                        i += 1;
+                        button = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    "--settle-ms" => {
+                        i += 1;
+                        settle_ms = rest.get(i).and_then(|v| v.parse::<i64>().ok());
+                    }
+                    other if !other.starts_with("--") && (popup.is_none() || button.is_none()) => {
+                        if let Some((p, b)) = other.split_once(':') {
+                            popup = popup.or_else(|| p.parse::<i64>().ok());
+                            button = button.or_else(|| b.parse::<i64>().ok());
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let usage = "ax-press-popup-button <popup>:<button>  |  \
+                         ax-press-popup-button --popup <N> --button <N> [--settle-ms <N>]";
+            let popup = popup.ok_or(ParseError::MissingArguments {
+                context: "ax-press-popup-button".to_string(),
+                usage,
+            })?;
+            let button = button.ok_or(ParseError::MissingArguments {
+                context: "ax-press-popup-button".to_string(),
+                usage,
+            })?;
+            let mut payload = json!({
+                "id": id,
+                "action": "ax_press_popup_button",
+                "popup": popup,
+                "button": button,
+            });
+            if let Some(s) = settle_ms {
+                payload["settle_ms"] = json!(s);
+            }
+            Ok(payload)
+        }
+
         // ax-enhance — set AXEnhancedUserInterface on Chrome's app element.
         // Chromium picks this up as an AT-detection signal and turns on
         // renderer accessibility, surfacing page <input> elements in the

@@ -1478,6 +1478,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "ax_click" => handle_ax_click(cmd, state).await,
         "ax_press" => handle_ax_press(cmd).await,
         "ax_press_button" => handle_ax_press_button(cmd).await,
+        "ax_press_popup_button" => handle_ax_press_popup_button(cmd).await,
         "ax_set_value" => handle_ax_set_value(cmd).await,
         "ax_enhance" => handle_ax_enhance(cmd).await,
         _ => Err(format!("Not yet implemented: {}", action)),
@@ -9101,6 +9102,52 @@ async fn handle_ax_press_button(cmd: &Value) -> Result<Value, String> {
 #[cfg(not(target_os = "macos"))]
 async fn handle_ax_press_button(_cmd: &Value) -> Result<Value, String> {
     Err("ax-press-button is only available on macOS".into())
+}
+
+// ---------------------------------------------------------------------------
+// AX press-popup-button — AXPress a button by its index inside one specific
+// popup, rather than by a label matched across the whole application.
+//
+// Needed because a title match is ambiguous exactly when it matters: two
+// Chrome bubbles up at once can both carry a "Close", and Chrome's toolbar and
+// tab strip carry more. It also reaches buttons that have no AXTitle at all —
+// a bubble's "X" is a template image named only by AXDescription — and lets a
+// caller act on a bubble without matching any label, which is the only way
+// this works in a UI language nobody anticipated.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+async fn handle_ax_press_popup_button(cmd: &Value) -> Result<Value, String> {
+    let pid = resolve_ax_pid(cmd).ok_or_else(|| {
+        "Chrome PID not found. Pass --ax-pid <N> or ensure Chrome is running with \
+         --remote-debugging-port=9222."
+            .to_string()
+    })?;
+
+    let popup = cmd
+        .get("popup")
+        .and_then(|v| v.as_i64())
+        .ok_or("ax-press-popup-button needs --popup <N>")? as usize;
+    let button = cmd
+        .get("button")
+        .and_then(|v| v.as_i64())
+        .ok_or("ax-press-popup-button needs --button <N>")? as usize;
+
+    let settle_ms = cmd
+        .get("settle_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(220) as u64;
+
+    let mut result = super::ax::press_popup_button(pid, popup, button, settle_ms)?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("pid".to_string(), json!(pid));
+    }
+    Ok(result)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn handle_ax_press_popup_button(_cmd: &Value) -> Result<Value, String> {
+    Err("ax-press-popup-button is only available on macOS".into())
 }
 
 // ---------------------------------------------------------------------------
