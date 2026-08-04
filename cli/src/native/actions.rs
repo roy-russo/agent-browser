@@ -6729,6 +6729,20 @@ async fn fetch_metadata_inner(
             parse_title_from_html(body)
         };
 
+        // The description and Open Graph pair come out of the same body we
+        // already hold, so they cost nothing extra. A title alone is often
+        // not enough to say what a site is — "Forever Forward" is JD Sports'
+        // slogan, and only the description identifies the shop.
+        let (raw_description, raw_og_title, raw_og_description) = if is_base64 {
+            (String::new(), String::new(), String::new())
+        } else {
+            (
+                parse_meta_from_html(body, "name", "description"),
+                parse_meta_from_html(body, "property", "og:title"),
+                parse_meta_from_html(body, "property", "og:description"),
+            )
+        };
+
         // Debug dump: write the body Chrome handed us to disk for
         // post-mortem inspection (compare against what `document.title`
         // ends up as after JS runs). One file per host, overwritten on
@@ -6756,8 +6770,29 @@ async fn fetch_metadata_inner(
             raw_html_title
         };
 
+        // Same reasoning as the title poll, for the same reason: a
+        // client-rendered page injects its <meta> tags after hydration, so
+        // the raw document carries none. One DOM read, and only when the
+        // raw HTML gave us nothing to describe the page with — a
+        // server-rendered page never pays for it.
+        let needs_dom_meta = !is_base64
+            && (200..400).contains(&status)
+            && raw_description.is_empty()
+            && raw_og_title.is_empty()
+            && raw_og_description.is_empty();
+        let (description, og_title, og_description) = if needs_dom_meta {
+            read_dom_metadata(client.as_ref(), &session_id)
+                .await
+                .unwrap_or((raw_description, raw_og_title, raw_og_description))
+        } else {
+            (raw_description, raw_og_title, raw_og_description)
+        };
+
         Ok(json!({
             "title": title,
+            "description": description,
+            "ogTitle": og_title,
+            "ogDescription": og_description,
             "status": status,
             "url": final_url,
         }))
@@ -6836,6 +6871,46 @@ async fn poll_document_title(
         tokio::time::sleep(tick).await;
     }
     last_title
+}
+
+/// One DOM read for the three description fields, for pages that inject
+/// their `<meta>` tags from JavaScript rather than serving them in the
+/// document. Unlike `poll_document_title` this does not poll: it runs
+/// after the title resolution, by which point the page has had its
+/// hydration window. Returns `None` on any failure so the caller keeps
+/// whatever the raw HTML gave it.
+async fn read_dom_metadata(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+) -> Option<(String, String, String)> {
+    let expression = r#"JSON.stringify({
+        d: document.querySelector('meta[name="description" i]')?.content || '',
+        ot: document.querySelector('meta[property="og:title" i]')?.content || '',
+        od: document.querySelector('meta[property="og:description" i]')?.content || ''
+    })"#
+    .to_string();
+    let result: Result<super::cdp::types::EvaluateResult, String> = client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &super::cdp::types::EvaluateParams {
+                expression,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await;
+    let value = result.ok()?.result.value?;
+    let parsed: Value = serde_json::from_str(value.as_str()?).ok()?;
+    let field = |k: &str| {
+        parsed
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    Some((field("d"), field("ot"), field("od")))
 }
 
 /// Diagnostic body dump for `fetch-metadata`. Writes the raw HTTP
@@ -6939,6 +7014,98 @@ fn parse_title_from_html(html: &str) -> String {
     };
 
     decode_entities(&raw)
+}
+
+/// Pull one `<meta>` tag's `content` out of raw HTML. `attr` is the
+/// identifying attribute (`name` or `property`) and `key` its value
+/// (`description`, `og:title`, …).
+///
+/// This scans whole tags rather than pattern-matching a fixed layout,
+/// because both attribute orders and both quote styles are common in the
+/// wild — `<meta content="…" name="description">` is as valid as the
+/// other way round, and a fixed pattern silently misses half the web.
+fn parse_meta_from_html(html: &str, attr: &str, key: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let key_lower = key.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find("<meta") {
+        let tag_start = search_from + rel;
+        let after_tag = tag_start + "<meta".len();
+        // Next char must end the tag name, else this is `<metadata>` etc.
+        let next_byte = lower.as_bytes().get(after_tag).copied();
+        let valid = matches!(
+            next_byte,
+            Some(b'>') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'/')
+        );
+        if !valid {
+            search_from = after_tag;
+            continue;
+        }
+        let Some(gt_rel) = lower[after_tag..].find('>') else {
+            break;
+        };
+        let tag_end = after_tag + gt_rel;
+        let tag_lower = &lower[tag_start..tag_end];
+        let tag_raw = html.get(tag_start..tag_end).unwrap_or("");
+        if attr_value(tag_lower, tag_lower, attr).to_ascii_lowercase() == key_lower {
+            let content = attr_value(tag_lower, tag_raw, "content");
+            if !content.is_empty() {
+                return decode_entities(content.trim());
+            }
+        }
+        search_from = tag_end;
+    }
+    String::new()
+}
+
+/// Read one attribute's value out of a single tag. `lower` is the
+/// lowercased tag (which is what gets searched) and `raw` the original
+/// (which is what gets sliced), so the returned value keeps its case.
+/// Byte offsets agree between the two because `to_ascii_lowercase` only
+/// remaps A–Z and leaves every multi-byte sequence alone.
+fn attr_value(lower: &str, raw: &str, attr: &str) -> String {
+    let bytes = lower.as_bytes();
+    let is_space = |b: Option<&u8>| matches!(b, Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r'));
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(attr) {
+        let at = from + rel;
+        // Must be a whole attribute name, not a suffix of another one
+        // (`property` contains no `name`, but `itemprop` would swallow a
+        // naive search for `prop`).
+        let before_ok = at == 0
+            || is_space(bytes.get(at - 1))
+            || matches!(bytes.get(at - 1), Some(b'/'));
+        let mut i = at + attr.len();
+        while is_space(bytes.get(i)) {
+            i += 1;
+        }
+        if before_ok && bytes.get(i) == Some(&b'=') {
+            i += 1;
+            while is_space(bytes.get(i)) {
+                i += 1;
+            }
+            let (quote, start) = match bytes.get(i) {
+                Some(&q) if q == b'"' || q == b'\'' => (Some(q), i + 1),
+                _ => (None, i),
+            };
+            let end = match quote {
+                Some(q) => match lower[start..].find(q as char) {
+                    Some(r) => start + r,
+                    None => return String::new(),
+                },
+                None => {
+                    let mut e = start;
+                    while e < bytes.len() && !is_space(bytes.get(e)) {
+                        e += 1;
+                    }
+                    e
+                }
+            };
+            return raw.get(start..end).unwrap_or("").to_string();
+        }
+        from = at + attr.len();
+    }
+    String::new()
 }
 
 fn decode_entities(s: &str) -> String {
@@ -9204,6 +9371,58 @@ mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
     use std::fs;
+
+    // `fetch-metadata` returns the description alongside the title because a
+    // title alone often does not say what a site is. These cover the shapes
+    // that actually appear in the wild — both attribute orders, both quote
+    // styles, and the near-miss tag names that a looser scan would swallow.
+
+    #[test]
+    fn meta_description_both_attribute_orders() {
+        let a = r#"<html><head><meta name="description" content="Sells running shoes."></head>"#;
+        assert_eq!(parse_meta_from_html(a, "name", "description"), "Sells running shoes.");
+        let b = r#"<html><head><meta content="Sells running shoes." name="description"></head>"#;
+        assert_eq!(parse_meta_from_html(b, "name", "description"), "Sells running shoes.");
+    }
+
+    #[test]
+    fn meta_open_graph_and_quote_styles() {
+        let html = r#"<meta property='og:title' content='Ocado'>
+                      <meta property="og:description" content="Online supermarket">"#;
+        assert_eq!(parse_meta_from_html(html, "property", "og:title"), "Ocado");
+        assert_eq!(
+            parse_meta_from_html(html, "property", "og:description"),
+            "Online supermarket"
+        );
+    }
+
+    #[test]
+    fn meta_case_insensitive_and_entity_decoded() {
+        let html = r#"<META NAME="Description" CONTENT="Bed &amp; breakfast">"#;
+        assert_eq!(parse_meta_from_html(html, "name", "description"), "Bed & breakfast");
+    }
+
+    #[test]
+    fn meta_ignores_lookalike_tags_and_missing_keys() {
+        // `<metadata>` is not `<meta>`, and og:title must not answer for
+        // a plain description request.
+        let html = r#"<metadata name="description" content="nope">
+                      <meta property="og:title" content="Title only">"#;
+        assert_eq!(parse_meta_from_html(html, "name", "description"), "");
+        assert_eq!(parse_meta_from_html(html, "property", "og:title"), "Title only");
+    }
+
+    #[test]
+    fn meta_survives_multibyte_bodies() {
+        // Byte offsets must agree between the lowercased copy and the raw
+        // slice — they only do because to_ascii_lowercase leaves non-ASCII
+        // sequences untouched.
+        let html = r#"<meta name="description" content="בנק לאומי — שירותי בנקאות">"#;
+        assert_eq!(
+            parse_meta_from_html(html, "name", "description"),
+            "בנק לאומי — שירותי בנקאות"
+        );
+    }
 
     // `external_attach` is what stops a dropped attachment being silently
     // replaced by a browser of our own (headless, blank profile — wrong target
