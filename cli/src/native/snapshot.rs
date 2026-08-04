@@ -583,7 +583,42 @@ pub async fn take_snapshot(
                         ? el.className.trim().split(/\s+/).filter(Boolean).slice(0, 2).join('.')
                         : '';
                     if (c) s += '.' + c;
-                    return s.slice(0, 120);
+                    // Top-layer elements (dialog.showModal, Popover API) render
+                    // above everything and ignore z-index, so a caller reasoning
+                    // about stacking would otherwise have no way to know. Marked
+                    // in the descriptor rather than a new field. Guarded: older
+                    // engines throw on the selector.
+                    try { if (el.matches(':modal, :popover-open')) s += ':top-layer'; } catch (e) {}
+                    return s.slice(0, 140);
+                };
+                // elementFromPoint stops at a shadow host, so a consent dialog
+                // inside a shadow root (OneTrust, Usercentrics, Didomi all use
+                // them) reports the host and never the real overlay. Descend.
+                var deepFromPoint = function(d, x, y) {
+                    var el = d.elementFromPoint(x, y), guard = 0;
+                    while (el && el.shadowRoot && guard++ < 12) {
+                        var inner = el.shadowRoot.elementFromPoint(x, y);
+                        if (!inner || inner === el) break;
+                        el = inner;
+                    }
+                    return el;
+                };
+                // `contains` does not cross shadow boundaries either, so climb
+                // with the host as the fallback parent. Without this, an element
+                // inside a shadow root looks "covered" by its own host.
+                var climb = function(n) {
+                    if (!n) return null;
+                    if (n.parentElement) return n.parentElement;
+                    var root = n.getRootNode ? n.getRootNode() : null;
+                    return (root && root.host) ? root.host : null;
+                };
+                var isWithin = function(ancestor, node) {
+                    var n = node, guard = 0;
+                    while (n && guard++ < 300) {
+                        if (n === ancestor) return true;
+                        n = climb(n);
+                    }
+                    return false;
                 };
                 var out = {
                     id: this.id || null,
@@ -609,10 +644,24 @@ pub async fn take_snapshot(
                 out.r = [Math.round(rc.left), Math.round(rc.top),
                          Math.round(rc.width), Math.round(rc.height)];
                 if (rc.width <= 0 || rc.height <= 0) out.hid = true;
+                // Prefer the platform's own answer: checkVisibility covers
+                // display, visibility, opacity and content-visibility in one
+                // call, and gets cases (content-visibility: auto) that a
+                // hand-rolled computed-style check misses. Both the original
+                // Chrome option names and the current spec aliases are passed —
+                // unknown dictionary members are ignored, so this is safe.
                 try {
-                    var st = win.getComputedStyle(this);
-                    if (st && (st.visibility === 'hidden' || st.display === 'none'
-                               || parseFloat(st.opacity) === 0)) out.hid = true;
+                    if (typeof this.checkVisibility === 'function') {
+                        if (!this.checkVisibility({
+                            checkOpacity: true, checkVisibilityCSS: true,
+                            opacityProperty: true, visibilityProperty: true,
+                            contentVisibilityAuto: true
+                        })) out.hid = true;
+                    } else {
+                        var st = win.getComputedStyle(this);
+                        if (st && (st.visibility === 'hidden' || st.display === 'none'
+                                   || parseFloat(st.opacity) === 0)) out.hid = true;
+                    }
                 } catch (e) {}
                 if (out.hid) return out;
 
@@ -621,11 +670,13 @@ pub async fn take_snapshot(
                     out.off = true;
                     return out;
                 }
-                var hit = doc.elementFromPoint(cx, cy);
+                var hit = deepFromPoint(doc, cx, cy);
                 if (!hit) { out.off = true; return out; }
                 // A descendant (the <span> inside a button) or an ancestor
-                // (a <label> wrapping an input) both count as not covered.
-                if (hit !== this && !this.contains(hit) && !hit.contains(this)) {
+                // (a <label> wrapping an input) both count as not covered —
+                // and the walk crosses shadow boundaries, so an element inside
+                // a shadow root is not reported as covered by its own host.
+                if (hit !== this && !isWithin(this, hit) && !isWithin(hit, this)) {
                     out.occ = true;
                     out.oc = desc(hit);
                     // The occluder's own rect, so a caller can scope "which

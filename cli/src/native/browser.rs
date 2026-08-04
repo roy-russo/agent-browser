@@ -520,6 +520,7 @@ impl BrowserManager {
                     "Target.createTarget",
                     &CreateTargetParams {
                         url: "about:blank".to_string(),
+                        background: None,
                     },
                     None,
                 )
@@ -896,6 +897,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: "about:blank".to_string(),
+                    background: None,
                 },
                 None,
             )
@@ -1034,6 +1036,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: target_url.to_string(),
+                    background: None,
                 },
                 None,
             )

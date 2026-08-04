@@ -141,6 +141,12 @@ pub struct SetDiscoverTargetsParams {
 #[serde(rename_all = "camelCase")]
 pub struct CreateTargetParams {
     pub url: String,
+    /// CDP: create the target without foregrounding it. `None` keeps the
+    /// foreground default for user-facing tabs; `Some(true)` is for
+    /// invisible one-shot work (fetch-metadata) where raising the Chrome
+    /// window would steal the user's screen on every call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -6546,6 +6546,11 @@ async fn fetch_metadata_inner(
             "Target.createTarget",
             &super::cdp::types::CreateTargetParams {
                 url: "about:blank".to_string(),
+                // Background: fetch-metadata is a one-shot invisible read.
+                // A foreground target makes macOS Chrome raise its window
+                // on every call — with a caller polling domains that is a
+                // window stealing the user's screen every few seconds.
+                background: Some(true),
             },
             None,
         )
